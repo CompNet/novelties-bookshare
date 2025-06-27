@@ -425,3 +425,120 @@ print(
 
 
 # %% Comparison between strategies
+import pathlib as pl
+import functools as ft
+from collections import defaultdict
+from novelties_bookshare.encrypt import encrypt_tokens
+from novelties_bookshare.decrypt import (
+    decrypt_tokens,
+    make_decryptplugin_mlm,
+    make_decryptplugin_propagate,
+    make_decryptplugin_splice,
+)
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+
+
+def load_book(path: pl.Path) -> tuple[list[str], list[str]]:
+    tokens = []
+    tags = []
+    for path in tqdm(sorted(path.glob("*.conll")), ascii=True):
+        chapter_tokens, chapter_tags = load_conll2002_bio(str(path))
+        tokens += chapter_tokens
+        tags += chapter_tags
+    return tokens, tags
+
+
+novelties_tokens, novelties_tags = load_book(
+    pl.Path("~/Dev/Novelties/corpus/Brave_New_World").expanduser()
+)
+
+wild_editions = {
+    "HC98": load_book(pl.Path("./data/editions_diff/HC98"))[0],
+    "HC04": load_book(pl.Path("./data/editions_diff/HC04"))[0],
+    "HC06": load_book(pl.Path("./data/editions_diff/HC06"))[0],
+    "RB06": load_book(pl.Path("./data/editions_diff/RB06"))[0],
+}
+
+
+def normalize_(tokens: list[str], replacements: list[tuple[list[str], str]]):
+    for i, token in enumerate(tokens):
+        for repl_source, repl_target in replacements:
+            if token in repl_source:
+                tokens[i] = repl_target
+
+
+# OPTIONAL: preprocessing
+normalize_(novelties_tokens, [(["``", "''"], '"')])
+normalize_(novelties_tokens, [(["…"], "...")])
+for tokens in wild_editions.values():
+    normalize_(tokens, [(["``", "''", "“", "”"], '"')])
+    normalize_(tokens, [(["‘", "’"], "'")])
+    normalize_(tokens, [(["…"], "...")])
+    normalize_(tokens, [(["—"], "-")])
+
+
+novelties_encrypted_tokens = encrypt_tokens(novelties_tokens)
+
+strategies = {
+    "naive": None,
+    "propagate": [make_decryptplugin_propagate()],
+    "splice": [make_decryptplugin_splice(max_token_len=24, max_splits_nb=4)],
+    "bert": [make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16)],
+    "pipe": [
+        make_decryptplugin_propagate(),
+        make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16),
+        make_decryptplugin_splice(max_token_len=24, max_splits_nb=4),
+        make_decryptplugin_propagate(),
+    ],
+}
+scores = {
+    strat: {ed: 0.0 for ed in wild_editions.keys()} for strat in strategies.keys()
+}
+
+progress = tqdm(total=len(wild_editions) * len(strategies), ascii=True)
+
+for edition, user_tokens in wild_editions.items():
+    for strat, strat_plugins in strategies.items():
+        progress.set_description(f"{edition}.{strat}")
+
+        errors = defaultdict(int)
+
+        decrypted_tokens = decrypt_tokens(
+            novelties_encrypted_tokens,
+            novelties_tags,
+            user_tokens,
+            hash_len=None,
+            decryption_plugins=strat_plugins,
+        )
+        percent_recovered = sum(
+            1 if novelties_token == decrypted_token else 0
+            for novelties_token, decrypted_token in zip(
+                novelties_tokens, decrypted_tokens
+            )
+        ) / len(novelties_tokens)
+        scores[strat][edition] = percent_recovered
+
+        for novelties_token, decrypted_token in zip(novelties_tokens, decrypted_tokens):
+            if novelties_token != decrypted_token:
+                errors[novelties_token] += 1
+        tqdm.write(str(errors))
+
+        progress.update()
+
+# %%
+bar_width = 0.15
+offset = bar_width * (len(strategies) / 2 - 0.5)
+fig, ax = plt.subplots()
+x = np.arange(len(wild_editions))
+for i, strat in enumerate(strategies):
+    strat_x = x + i * bar_width - offset
+    y = np.array(list(scores[strat].values())) * 100
+    bars = ax.bar(strat_x, y, bar_width, label=strat)
+    ax.bar_label(bars, fmt="%.2f")
+ax.set_xticks(x)
+ax.set_xticklabels(wild_editions.keys())
+ax.set_ylim(80.0, 100.0)
+ax.legend()
+plt.show()
