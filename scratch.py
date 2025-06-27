@@ -1,4 +1,40 @@
 # -*- eval: (code-cells-mode); -*-
+# %%
+import pathlib as pl
+from novelties_bookshare.conll import load_conll2002_bio
+from tqdm import tqdm
+
+
+NOVELTIES_PATH = pl.Path("~/Dev/Novelties/corpus").expanduser()
+corpus = [
+    NOVELTIES_PATH / "1984",
+    NOVELTIES_PATH / "Bel_Ami",
+    NOVELTIES_PATH / "Brave_New_World",
+    NOVELTIES_PATH / "Eugenie_Grandet/en",
+    NOVELTIES_PATH / "Germinal/en",
+    NOVELTIES_PATH / "Madame_Bovary/en",
+    NOVELTIES_PATH / "Moby_Dick",
+    NOVELTIES_PATH / "The_Black_Company",
+    NOVELTIES_PATH / "The_Blade_Itself",
+    NOVELTIES_PATH / "The_Colour_Of_Magic",
+    NOVELTIES_PATH / "The_Hunchback_of_Notre-Dame/en",
+    NOVELTIES_PATH / "The_Light_Fantastic",
+    NOVELTIES_PATH / "The_Red_And_The_Black",
+    NOVELTIES_PATH / "The_Three_Musketeers/en",
+]
+
+
+def load_book(path: pl.Path) -> tuple[list[str], list[str]]:
+    tokens = []
+    tags = []
+    for path in tqdm(sorted(path.glob("*.conll")), ascii=True):
+        chapter_tokens, chapter_tags = load_conll2002_bio(str(path))
+        tokens += chapter_tokens
+        tags += chapter_tags
+    return tokens, tags
+
+
+# %%
 
 # %%
 from typing import *
