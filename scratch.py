@@ -540,5 +540,6 @@ for i, strat in enumerate(strategies):
 ax.set_xticks(x)
 ax.set_xticklabels(wild_editions.keys())
 ax.set_ylim(80.0, 100.0)
+ax.set_ylabel("percentage of retrieved tokens")
 ax.legend()
 plt.show()
