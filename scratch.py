@@ -1,26 +1,27 @@
 # -*- eval: (code-cells-mode); -*-
 # %%
+from typing import *
 import pathlib as pl
 from novelties_bookshare.conll import load_conll2002_bio
 from tqdm import tqdm
 
 
-NOVELTIES_PATH = pl.Path("~/Dev/Novelties/corpus").expanduser()
+NOVELTIES_PATH = pl.Path("~/Dev/Novelties").expanduser()
 corpus = [
-    NOVELTIES_PATH / "1984",
-    NOVELTIES_PATH / "Bel_Ami",
-    NOVELTIES_PATH / "Brave_New_World",
-    NOVELTIES_PATH / "Eugenie_Grandet/en",
-    NOVELTIES_PATH / "Germinal/en",
-    NOVELTIES_PATH / "Madame_Bovary/en",
-    NOVELTIES_PATH / "Moby_Dick",
-    NOVELTIES_PATH / "The_Black_Company",
-    NOVELTIES_PATH / "The_Blade_Itself",
-    NOVELTIES_PATH / "The_Colour_Of_Magic",
-    NOVELTIES_PATH / "The_Hunchback_of_Notre-Dame/en",
-    NOVELTIES_PATH / "The_Light_Fantastic",
-    NOVELTIES_PATH / "The_Red_And_The_Black",
-    NOVELTIES_PATH / "The_Three_Musketeers/en",
+    NOVELTIES_PATH / "corpus" / "1984",
+    NOVELTIES_PATH / "corpus" / "Bel_Ami",
+    NOVELTIES_PATH / "corpus" / "Brave_New_World",
+    NOVELTIES_PATH / "corpus" / "Eugenie_Grandet/en",
+    NOVELTIES_PATH / "corpus" / "Germinal/en",
+    NOVELTIES_PATH / "corpus" / "Madame_Bovary/en",
+    NOVELTIES_PATH / "corpus" / "Moby_Dick",
+    NOVELTIES_PATH / "corpus" / "The_Black_Company",
+    NOVELTIES_PATH / "corpus" / "The_Blade_Itself",
+    NOVELTIES_PATH / "corpus" / "The_Colour_Of_Magic",
+    NOVELTIES_PATH / "corpus" / "The_Hunchback_of_Notre-Dame/en",
+    NOVELTIES_PATH / "corpus" / "The_Light_Fantastic",
+    NOVELTIES_PATH / "corpus" / "The_Red_And_The_Black",
+    NOVELTIES_PATH / "corpus" / "The_Three_Musketeers/en",
 ]
 
 
@@ -37,11 +38,11 @@ def load_book(path: pl.Path) -> tuple[list[str], list[str]]:
 # %%
 from typing import *
 import os, glob
-from novelties_bookshare.encrypt import encrypt_tokens
+from novelties_bookshare.encrypt import encrypt_token, encrypt_tokens
 from novelties_bookshare.decrypt import (
     decrypt_tokens,
     plugin_mlm,
-    plugin_splice,
+    plugin_split,
     make_plugin_mlm,
     make_plugin_propagate,
 )
@@ -182,7 +183,7 @@ from novelties_bookshare.decrypt import (
     decrypt_tokens,
     make_plugin_mlm,
     make_plugin_propagate,
-    make_plugin_splice,
+    make_plugin_split,
 )
 
 # %%
@@ -209,7 +210,7 @@ decrypt_fns = [
         "name": "splice",
         "fn": ft.partial(
             decrypt_tokens,
-            decryption_plugins=[make_plugin_splice(max_token_len=24, max_splits_nb=4)],
+            decryption_plugins=[make_plugin_split(max_token_len=24, max_splits_nb=4)],
         ),
     },
     {
@@ -226,7 +227,7 @@ decrypt_fns = [
         "fn": ft.partial(
             decrypt_tokens,
             decryption_plugins=[
-                make_plugin_splice(max_token_len=24, max_splits_nb=4),
+                make_plugin_split(max_token_len=24, max_splits_nb=4),
                 make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
                 make_plugin_propagate(),
             ],
@@ -369,7 +370,7 @@ from novelties_bookshare.decrypt import (
     encrypt_tokens,
     decrypt_tokens,
     plugin_mlm,
-    plugin_splice,
+    plugin_split,
     make_plugin_mlm,
 )
 
@@ -388,7 +389,7 @@ for tag, i1, i2, j1, j2 in matcher.get_opcodes():
 print(decrypt_tokens(encrypted_tokens, tags, user_tokens))
 print(
     decrypt_tokens(
-        encrypted_tokens, tags, user_tokens, decryption_plugins=[plugin_splice]
+        encrypted_tokens, tags, user_tokens, decryption_plugins=[plugin_split]
     )
 )
 
@@ -425,7 +426,7 @@ from novelties_bookshare.decrypt import (
     decrypt_tokens,
     make_plugin_mlm,
     make_plugin_propagate,
-    make_plugin_splice,
+    make_plugin_split,
 )
 import matplotlib.pyplot as plt
 import numpy as np
@@ -476,12 +477,12 @@ novelties_encrypted_tokens = encrypt_tokens(novelties_tokens)
 strategies = {
     "naive": None,
     "propagate": [make_plugin_propagate()],
-    "splice": [make_plugin_splice(max_token_len=24, max_splits_nb=4)],
+    "splice": [make_plugin_split(max_token_len=24, max_splits_nb=4)],
     "bert": [make_plugin_mlm("answerdotai/ModernBERT-base", window=16)],
     "pipe": [
         make_plugin_propagate(),
         make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
-        make_plugin_splice(max_token_len=24, max_splits_nb=4),
+        make_plugin_split(max_token_len=24, max_splits_nb=4),
         make_plugin_propagate(),
     ],
 }
@@ -534,3 +535,48 @@ ax.set_xticklabels(wild_editions.keys())
 ax.set_ylabel("Number of errors")
 ax.legend()
 plt.show()
+
+
+# %%
+import difflib
+from novelties_bookshare.experiments.data import load_book
+from novelties_bookshare.decrypt import decrypt_tokens
+from novelties_bookshare.encrypt import encrypt_token
+
+
+def plugin_case(
+    matcher: difflib.SequenceMatcher,
+    user_tokens: list[str],
+    decrypted_tokens: list[str],
+    encrypted_tokens: list[str],
+    hash_len: Optional[int],
+) -> list[str]:
+    """Fix incorrect user token casing."""
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace":
+            continue
+
+        for k, (user_token, encrypted_token) in enumerate(
+            zip(user_tokens[j1:j2], encrypted_tokens[i1:i2])
+        ):
+            for casing in [str.lower, str.upper, str.capitalize]:
+                encrypted_user_token = encrypt_token(
+                    casing(user_token), hash_len=hash_len
+                )
+                if encrypted_user_token == encrypted_token:
+                    decrypted_tokens[i1 + k] = user_token
+
+    return decrypted_tokens
+
+
+ref_tokens, ref_tags = load_book("/home/aethor/Dev/Novelties/corpus/Brave_New_World")
+encrypted_tokens = encrypt_tokens(ref_tokens)
+user_tokens, _ = load_book("./data/editions_diff/Brave_New_World/HC98")
+
+naive_decrypted = decrypt_tokens(encrypted_tokens, ref_tags, user_tokens)
+print(sum(1 if ref != pred else 0 for ref, pred in zip(ref_tokens, naive_decrypted)))
+
+case_decrypted = decrypt_tokens(
+    encrypted_tokens, ref_tags, user_tokens, decryption_plugins=[plugin_case]
+)
+print(sum(1 if ref != pred else 0 for ref, pred in zip(ref_tokens, case_decrypted)))
