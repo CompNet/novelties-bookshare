@@ -540,33 +540,15 @@ plt.show()
 # %%
 import difflib
 from novelties_bookshare.experiments.data import load_book
-from novelties_bookshare.decrypt import decrypt_tokens
-from novelties_bookshare.encrypt import encrypt_token
-
-
-def plugin_case(
-    matcher: difflib.SequenceMatcher,
-    user_tokens: list[str],
-    decrypted_tokens: list[str],
-    encrypted_tokens: list[str],
-    hash_len: Optional[int],
-) -> list[str]:
-    """Fix incorrect user token casing."""
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag != "replace":
-            continue
-
-        for k, (user_token, encrypted_token) in enumerate(
-            zip(user_tokens[j1:j2], encrypted_tokens[i1:i2])
-        ):
-            for casing in [str.lower, str.upper, str.capitalize]:
-                encrypted_user_token = encrypt_token(
-                    casing(user_token), hash_len=hash_len
-                )
-                if encrypted_user_token == encrypted_token:
-                    decrypted_tokens[i1 + k] = user_token
-
-    return decrypted_tokens
+from novelties_bookshare.decrypt import (
+    decrypt_tokens,
+    make_plugin_cycle,
+    make_plugin_case,
+    make_plugin_propagate,
+    make_plugin_mlm,
+    make_plugin_split,
+)
+from novelties_bookshare.encrypt import encrypt_tokens
 
 
 ref_tokens, ref_tags = load_book("/home/aethor/Dev/Novelties/corpus/Brave_New_World")
@@ -576,7 +558,154 @@ user_tokens, _ = load_book("./data/editions_diff/Brave_New_World/HC98")
 naive_decrypted = decrypt_tokens(encrypted_tokens, ref_tags, user_tokens)
 print(sum(1 if ref != pred else 0 for ref, pred in zip(ref_tokens, naive_decrypted)))
 
-case_decrypted = decrypt_tokens(
-    encrypted_tokens, ref_tags, user_tokens, decryption_plugins=[plugin_case]
+cycle_decrypted = decrypt_tokens(
+    encrypted_tokens,
+    ref_tags,
+    user_tokens,
+    decryption_plugins=[
+        make_plugin_cycle(
+            [
+                make_plugin_propagate(),
+                make_plugin_case(),
+                make_plugin_split(max_token_len=24, max_splits_nb=4),
+                make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
+            ],
+            budget=None,
+        )
+    ],
 )
-print(sum(1 if ref != pred else 0 for ref, pred in zip(ref_tokens, case_decrypted)))
+print(sum(1 if ref != pred else 0 for ref, pred in zip(ref_tokens, cycle_decrypted)))
+
+# %%
+# A refined proof-of-concept for a word-level frequency attack.
+# This version uses the NLTK Brown Corpus to generate a realistic
+# frequency list of English words.
+
+from novelties_bookshare.experiments.data import load_conll2002_bio
+from collections import Counter
+import nltk
+from nltk.corpus import brown
+
+nltk.download("brown")
+
+
+def generate_frequency_list(corpus):
+    """
+    Generates a list of the most common words from a given corpus.
+
+    Args:
+        corpus: An NLTK corpus object.
+
+    Returns:
+        list: A list of the most common words, sorted by frequency.
+    """
+    # Get all words from the corpus and convert them to lowercase
+    all_words = [word.lower() for word in corpus.words()]
+
+    # Count the frequency of each word.
+    word_frequencies = Counter(all_words)
+
+    # Exclude common "stopwords" like 'the', 'a', 'is' to focus on more
+    # meaningful words for a more advanced analysis, but for this basic
+    # attack, we will include them.
+
+    # Get the 100 most common words.
+    most_common = [word for word, count in word_frequencies.most_common(100)]
+    return most_common
+    # return word_frequencies
+
+
+def frequency_attack(ciphertext, known_words):
+    """
+    Performs a word-level frequency attack on a list of tokens.
+
+    Args:
+        ciphertext (list): A list of encrypted word tokens.
+        known_words (list): A list of common words in the plaintext language,
+                            sorted by frequency (most common first).
+
+    Returns:
+        tuple: A tuple containing the list of decrypted tokens and the
+               substitution map.
+    """
+    # 1. Count the frequency of each token in the ciphertext.
+    ciphertext_frequencies = Counter(ciphertext)
+
+    # 2. Get the unique tokens from the ciphertext, sorted by their frequency.
+    encrypted_tokens_sorted_by_frequency = [
+        token for token, count in ciphertext_frequencies.most_common()
+    ]
+
+    # 3. Create a substitution map.
+    substitution_map = {}
+    for i, encrypted_token in enumerate(encrypted_tokens_sorted_by_frequency):
+        if i < len(known_words):
+            substitution_map[encrypted_token] = known_words[i]
+        else:
+            substitution_map[encrypted_token] = f"UNKNOWN_WORD_{i}"
+
+    # 4. Decrypt the original ciphertext list using the substitution map.
+    decrypted_tokens = [substitution_map.get(token, token) for token in ciphertext]
+
+    return decrypted_tokens, substitution_map
+    # Generate a frequency list from a real corpus.
+    # Note: WordNet's own frequency counts are based on a very small, outdated
+    # corpus and are often inaccurate, so using the Brown Corpus is a more
+    # effective demonstration.
+
+
+most_common_english_words = generate_frequency_list(brown)
+
+# ref_tokens, ref_tags = load_book("/home/aethor/Dev/Novelties/corpus/Brave_New_World")
+# encrypted_tokens = encrypt_tokens(ref_tokens)
+# user_tokens, _ = load_book("./data/editions_diff/Brave_New_World/HC98")
+ref_tokens, ref_tags = load_conll2002_bio(
+    "./data/editions_diff/Brave_New_World/HC98/chapter_1.conll"
+)
+encrypted_tokens = encrypt_tokens(ref_tokens)
+user_tokens, _ = load_conll2002_bio(
+    "./data/editions_diff/Brave_New_World/HC98/chapter_1.conll"
+)
+
+# Perform the attack
+decrypted_result, mapping = frequency_attack(
+    encrypted_tokens, most_common_english_words
+)
+
+decrypted_tokens = decrypt_tokens(
+    encrypted_tokens,
+    ref_tags,
+    decrypted_result,
+    decryption_plugins=[
+        make_plugin_cycle(
+            [
+                make_plugin_propagate(),
+                make_plugin_case(),
+                make_plugin_split(max_token_len=24, max_splits_nb=4),
+                make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
+            ],
+            budget=None,
+        )
+    ],
+)
+
+# Print the results
+print("Corpus Used:", "Brown Corpus (via NLTK)")
+print("Original Encrypted Tokens:")
+# print(encrypted_tokens)
+print("\n---")
+print("Frequency-Based Substitution Map:")
+# for key, value in mapping.items():
+#     print(f"'{key}' -> '{value}'")
+print("\n---")
+print("Attempted Decrypted Result:")
+print()
+print(decrypted_result)
+errors = sum(
+    1 if ref != pred else 0
+    for ref, pred in zip(
+        encrypted_tokens,
+        encrypt_tokens(decrypted_tokens, hash_len=64),
+    )
+)
+print(errors)
