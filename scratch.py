@@ -35,17 +35,15 @@ def load_book(path: pl.Path) -> tuple[list[str], list[str]]:
 
 
 # %%
-
-# %%
 from typing import *
 import os, glob
 from novelties_bookshare.encrypt import encrypt_tokens
 from novelties_bookshare.decrypt import (
     decrypt_tokens,
-    decryptplugin_mlm,
-    decryptplugin_splice,
-    make_decryptplugin_mlm,
-    make_decryptplugin_propagate,
+    plugin_mlm,
+    plugin_splice,
+    make_plugin_mlm,
+    make_plugin_propagate,
 )
 from novelties_bookshare.conll import load_conll2002_bio
 
@@ -182,9 +180,9 @@ from more_itertools import flatten
 from tqdm import tqdm
 from novelties_bookshare.decrypt import (
     decrypt_tokens,
-    make_decryptplugin_mlm,
-    make_decryptplugin_propagate,
-    make_decryptplugin_splice,
+    make_plugin_mlm,
+    make_plugin_propagate,
+    make_plugin_splice,
 )
 
 # %%
@@ -205,17 +203,13 @@ decrypt_fns = [
     {"name": "naive", "fn": decrypt_tokens},
     {
         "name": "propagate",
-        "fn": ft.partial(
-            decrypt_tokens, decryption_plugins=[make_decryptplugin_propagate()]
-        ),
+        "fn": ft.partial(decrypt_tokens, decryption_plugins=[make_plugin_propagate()]),
     },
     {
         "name": "splice",
         "fn": ft.partial(
             decrypt_tokens,
-            decryption_plugins=[
-                make_decryptplugin_splice(max_token_len=24, max_splits_nb=4)
-            ],
+            decryption_plugins=[make_plugin_splice(max_token_len=24, max_splits_nb=4)],
         ),
     },
     {
@@ -223,7 +217,7 @@ decrypt_fns = [
         "fn": ft.partial(
             decrypt_tokens,
             decryption_plugins=[
-                make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16)
+                make_plugin_mlm("answerdotai/ModernBERT-base", window=16)
             ],
         ),
     },
@@ -232,9 +226,9 @@ decrypt_fns = [
         "fn": ft.partial(
             decrypt_tokens,
             decryption_plugins=[
-                make_decryptplugin_splice(max_token_len=24, max_splits_nb=4),
-                make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16),
-                make_decryptplugin_propagate(),
+                make_plugin_splice(max_token_len=24, max_splits_nb=4),
+                make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
+                make_plugin_propagate(),
             ],
         ),
     },
@@ -374,9 +368,9 @@ import difflib
 from novelties_bookshare.decrypt import (
     encrypt_tokens,
     decrypt_tokens,
-    decryptplugin_mlm,
-    decryptplugin_splice,
-    make_decryptplugin_mlm,
+    plugin_mlm,
+    plugin_splice,
+    make_plugin_mlm,
 )
 
 tokens = "Lianna princesse de Fomalhaut".split()
@@ -394,7 +388,7 @@ for tag, i1, i2, j1, j2 in matcher.get_opcodes():
 print(decrypt_tokens(encrypted_tokens, tags, user_tokens))
 print(
     decrypt_tokens(
-        encrypted_tokens, tags, user_tokens, decryption_plugins=[decryptplugin_splice]
+        encrypted_tokens, tags, user_tokens, decryption_plugins=[plugin_splice]
     )
 )
 
@@ -417,9 +411,7 @@ print(
         encrypted_tokens,
         tags,
         user_tokens,
-        decryption_plugins=[
-            make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16)
-        ],
+        decryption_plugins=[make_plugin_mlm("answerdotai/ModernBERT-base", window=16)],
     )
 )
 
@@ -431,9 +423,9 @@ from collections import defaultdict
 from novelties_bookshare.encrypt import encrypt_tokens
 from novelties_bookshare.decrypt import (
     decrypt_tokens,
-    make_decryptplugin_mlm,
-    make_decryptplugin_propagate,
-    make_decryptplugin_splice,
+    make_plugin_mlm,
+    make_plugin_propagate,
+    make_plugin_splice,
 )
 import matplotlib.pyplot as plt
 import numpy as np
@@ -483,18 +475,23 @@ novelties_encrypted_tokens = encrypt_tokens(novelties_tokens)
 
 strategies = {
     "naive": None,
-    "propagate": [make_decryptplugin_propagate()],
-    "splice": [make_decryptplugin_splice(max_token_len=24, max_splits_nb=4)],
-    "bert": [make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16)],
+    "propagate": [make_plugin_propagate()],
+    "splice": [make_plugin_splice(max_token_len=24, max_splits_nb=4)],
+    "bert": [make_plugin_mlm("answerdotai/ModernBERT-base", window=16)],
     "pipe": [
-        make_decryptplugin_propagate(),
-        make_decryptplugin_mlm("answerdotai/ModernBERT-base", window=16),
-        make_decryptplugin_splice(max_token_len=24, max_splits_nb=4),
-        make_decryptplugin_propagate(),
+        make_plugin_propagate(),
+        make_plugin_mlm("answerdotai/ModernBERT-base", window=16),
+        make_plugin_splice(max_token_len=24, max_splits_nb=4),
+        make_plugin_propagate(),
     ],
 }
-scores = {
-    strat: {ed: 0.0 for ed in wild_editions.keys()} for strat in strategies.keys()
+# { strategy => { edition => errors_nb } }
+errors_nb = {
+    strat: {ed: 0 for ed in wild_editions.keys()} for strat in strategies.keys()
+}
+errors = {
+    strat: {ed: defaultdict(int) for ed in wild_editions.keys()}
+    for strat in strategies.keys()
 }
 
 progress = tqdm(total=len(wild_editions) * len(strategies), ascii=True)
@@ -503,8 +500,6 @@ for edition, user_tokens in wild_editions.items():
     for strat, strat_plugins in strategies.items():
         progress.set_description(f"{edition}.{strat}")
 
-        errors = defaultdict(int)
-
         decrypted_tokens = decrypt_tokens(
             novelties_encrypted_tokens,
             novelties_tags,
@@ -512,18 +507,15 @@ for edition, user_tokens in wild_editions.items():
             hash_len=None,
             decryption_plugins=strat_plugins,
         )
-        percent_recovered = sum(
-            1 if novelties_token == decrypted_token else 0
-            for novelties_token, decrypted_token in zip(
-                novelties_tokens, decrypted_tokens
-            )
-        ) / len(novelties_tokens)
-        scores[strat][edition] = percent_recovered
+        local_errors_nb = sum(
+            1 if ref != pred else 0
+            for ref, pred in zip(novelties_tokens, decrypted_tokens)
+        )
+        errors_nb[strat][edition] = local_errors_nb
 
-        for novelties_token, decrypted_token in zip(novelties_tokens, decrypted_tokens):
-            if novelties_token != decrypted_token:
-                errors[novelties_token] += 1
-        tqdm.write(str(errors))
+        for ref, pred in zip(novelties_tokens, decrypted_tokens):
+            if ref != pred:
+                errors[strat][edition][ref] += 1
 
         progress.update()
 
@@ -534,12 +526,11 @@ fig, ax = plt.subplots()
 x = np.arange(len(wild_editions))
 for i, strat in enumerate(strategies):
     strat_x = x + i * bar_width - offset
-    y = np.array(list(scores[strat].values())) * 100
+    y = np.array(list(errors_nb[strat].values()))
     bars = ax.bar(strat_x, y, bar_width, label=strat)
-    ax.bar_label(bars, fmt="%.2f")
+    ax.bar_label(bars)
 ax.set_xticks(x)
 ax.set_xticklabels(wild_editions.keys())
-ax.set_ylim(80.0, 100.0)
-ax.set_ylabel("percentage of retrieved tokens")
+ax.set_ylabel("Number of errors")
 ax.legend()
 plt.show()
