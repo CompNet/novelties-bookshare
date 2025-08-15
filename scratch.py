@@ -709,3 +709,112 @@ errors = sum(
     )
 )
 print(errors)
+
+# %%
+import nltk
+from nltk.util import ngrams
+import math
+from collections import Counter
+from nltk.corpus import brown
+
+nltk.download("brown")
+
+
+def freq(tokens: list) -> dict[Any, float]:
+    counter = Counter(tokens)
+    return {token: count / len(tokens) for token, count in counter.items()}
+
+
+def entropy(dist: list[float]) -> float:
+    return -sum(prob * math.log2(prob) for prob in dist)
+
+
+def guesses_nb(dist: list[float]) -> float:
+    return sum(i * prob for i, prob in enumerate(sorted(dist, key=lambda v: -v)))
+
+
+def token_entropy(freq_corpus: list[str], ngram_len: int) -> float:
+    return entropy(list(freq(list(ngrams(freq_corpus, ngram_len))).values()))
+
+
+# %%
+guesses_nb(freq(list(wordnet.words())).values())
+
+
+# %%
+import matplotlib.pyplot as plt
+
+# 1984
+tokens, _ = load_book(corpus[0])
+
+x = list(range(1, 10))
+y = []
+for ngram_len in x:
+    token_ngrams = list(ngrams(tokens, ngram_len))
+    y.append(guesses_nb(list(freq(token_ngrams).values())))
+
+plt.plot(x, y)
+plt.title(
+    "Nombre d'essais moyens nécéssaires pour deviner le premier ngram du texte en connaissant la distribution de probabilité des ngrams du texte (1984)"
+)
+plt.ylabel("Nombre d'essais")
+plt.xlabel("Longueur du ngram")
+plt.show()
+
+# %%
+attack_tokens = []
+for other_book in corpus[1:]:
+    attack_tokens += load_book(other_book)[0]
+
+x = list(range(1, 10))
+y = []
+for ngram_len in x:
+    attack_freq = freq(list(ngrams(attack_tokens, ngram_len)))
+    token_freq = freq(list(ngrams(tokens, ngram_len)))
+    y.append(
+        len(set(token_freq.keys()) & set(attack_freq.keys()))
+        / len(set(token_freq.keys()))
+    )
+
+plt.plot(x, y)
+plt.title("Couverture des ngrams de 1984 dans le reste du corpus Novelties")
+plt.ylabel("Couverture")
+plt.xlabel("Longueur des ngrams")
+plt.show()
+
+# %%
+for ngram_len in list(range(1, 10)):
+    # attack_freq = freq(list(ngrams(attack_tokens, ngram_len)))
+    token_freq = freq(list(ngrams(tokens, ngram_len)))
+    attack_freq = {token: 1 / len(token_freq) for token in token_freq.keys()}
+    print(
+        sum(
+            i * token_freq[token]
+            for i, token in enumerate(
+                sorted(token_freq, key=lambda token: -attack_freq.get(token, 0))
+            )
+        )
+    )
+    print(guesses_nb(token_freq.values()))
+
+
+# %%
+from nltk.corpus import wordnet
+
+nltk.download("wordnet")
+
+len(set(wordnet.words()))
+
+
+# %%
+def coverage(novel: list[str], freq_corpus: list[str], ngram_len: int) -> float:
+    novel_chunks = set(ngrams(novel, ngram_len))
+    freq_corpus_chunks = set(ngrams(freq_corpus, ngram_len))
+    return len(novel_chunks & freq_corpus_chunks) / len(novel_chunks)
+
+
+print(coverage(tokens, brown.words(), 1))
+print(coverage(tokens, brown.words(), 2))
+print(coverage(tokens, brown.words(), 3))
+print(coverage(tokens, brown.words(), 4))
+print(coverage(tokens, brown.words(), 5))
