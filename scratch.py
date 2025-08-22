@@ -715,9 +715,10 @@ import nltk
 from nltk.util import ngrams
 import math
 from collections import Counter
-from nltk.corpus import brown
+from nltk.corpus import brown, wordnet
 
 nltk.download("brown")
+nltk.download("wordnet")
 
 
 def freq(tokens: list) -> dict[Any, float]:
@@ -782,29 +783,6 @@ plt.ylabel("Couverture")
 plt.xlabel("Longueur des ngrams")
 plt.show()
 
-# %%
-for ngram_len in list(range(1, 10)):
-    # attack_freq = freq(list(ngrams(attack_tokens, ngram_len)))
-    token_freq = freq(list(ngrams(tokens, ngram_len)))
-    attack_freq = {token: 1 / len(token_freq) for token in token_freq.keys()}
-    print(
-        sum(
-            i * token_freq[token]
-            for i, token in enumerate(
-                sorted(token_freq, key=lambda token: -attack_freq.get(token, 0))
-            )
-        )
-    )
-    print(guesses_nb(token_freq.values()))
-
-
-# %%
-from nltk.corpus import wordnet
-
-nltk.download("wordnet")
-
-len(set(wordnet.words()))
-
 
 # %%
 def coverage(novel: list[str], freq_corpus: list[str], ngram_len: int) -> float:
@@ -818,3 +796,110 @@ print(coverage(tokens, brown.words(), 2))
 print(coverage(tokens, brown.words(), 3))
 print(coverage(tokens, brown.words(), 4))
 print(coverage(tokens, brown.words(), 5))
+
+# %%
+from novelties_bookshare.encrypt import encrypt_tokens
+from collections import defaultdict
+from statistics import mean
+import matplotlib.pyplot as plt
+
+tokens, _ = load_book(corpus[0])
+
+x = list(range(1, 65))
+y = []
+for hash_len in x:
+    hash2tokens = defaultdict(set)
+    encrypted = encrypt_tokens(tokens, hash_len=hash_len)
+    for e, token in zip(encrypted, tokens):
+        hash2tokens[e].add(token)
+    y.append(mean(len(v) - 1 for v in hash2tokens.values()))
+
+plt.plot(x, y)
+for xi, yi in zip(x, y):
+    plt.text(xi, yi, f"{yi:.2f}", ha="center", va="bottom", fontsize=9, color="red")
+plt.ylabel("Mean number of collisions for a given hash")
+plt.xlabel("hash len")
+plt.grid()
+plt.show()
+
+# %%
+hash_len = 2
+tokens, _ = load_book(corpus[0])
+encrypted = encrypt_tokens(tokens, hash_len=hash_len)
+
+perfect_dist = freq(tokens)
+freq_sorted_tokens = list(reversed(sorted(perfect_dist.keys(), key=perfect_dist.get)))
+freq_sorted_hashs = encrypt_tokens(freq_sorted_tokens, hash_len=hash_len)
+
+guessed_tokens = []
+for e in tqdm(encrypted, ascii=True):
+    # we guess the most frequent word
+    for guess_token, guess_hash in zip(freq_sorted_tokens, freq_sorted_hashs):
+        if guess_hash == e:
+            guessed_tokens.append(guess_token)
+            break
+
+print(mean(1 if guess == token else 0 for guess, token in zip(guessed_tokens, tokens)))
+
+# %%
+import torch
+from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+from novelties_bookshare.encrypt import encrypt_token
+
+
+def next_probs(
+    text_so_far: str, tokens: set[str], model, tokenizer
+) -> dict[str, float]:
+    device = torch.device("cuda")
+    encoded_text = tokenizer(text_so_far, return_tensors="pt").to(device)
+    with torch.inference_mode():
+        outputs = model(**encoded_text)
+    next_token_logits = outputs.logits[0, -1, :]
+    next_token_probs = torch.softmax(next_token_logits, -1)
+    topk_next_tokens = torch.topk(next_token_probs, 1000)
+    probs = {
+        (tokenizer.decode(idx)): prob.item()
+        for idx, prob in zip(topk_next_tokens.indices, topk_next_tokens.values)
+    }
+    # NOTE: GPT2 adds a space in front of the word. Good luck with
+    # other models... -_-
+    probs = {t[1:]: p for t, p in probs.items()}
+    probs = {t: p for t, p in probs.items() if t in tokens}
+    return probs
+
+
+def beam_search(
+    start_token: str, guessed_tokens: list[set[str]], model, tokenizer
+) -> list[str]:
+    beams = []
+    text_so_far = [start_token]
+    for g in tqdm(guessed_tokens):
+        probs = next_probs(" ".join(text_so_far), g, model, tokenizer)
+        next_token = max(g, key=lambda t: probs.get(t, 0))
+        text_so_far.append(next_token)
+    return text_so_far
+
+
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+model = GPT2LMHeadModel.from_pretrained("gpt2")
+model = model.to(torch.device("cuda"))
+
+hash_len = 2
+tokens, _ = load_book(corpus[0])
+encrypted = encrypt_tokens(tokens, hash_len=hash_len)
+
+h_voc = {t: encrypt_token(t, hash_len=hash_len) for t in set(tokens)}
+# perfect_dist = freq(tokens)
+# freq_sorted_tokens = list(reversed(sorted(perfect_dist.keys(), key=perfect_dist.get)))
+# freq_sorted_hashs = encrypt_tokens(freq_sorted_tokens, hash_len=hash_len)
+
+guessed_tokens = []
+for e in tqdm(encrypted, ascii=True):
+    guessed_tokens.append({t for t, h in h_voc.items() if h == e})
+
+# let's be crazy and give the first token for free
+guessed_tokens = beam_search(tokens[0], guessed_tokens[1:][:1000], model, tokenizer)
+
+print(
+    mean(1 if guess == token else 0 for guess, token in zip(guessed_tokens, tokens[1:]))
+)
