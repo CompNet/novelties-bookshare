@@ -842,46 +842,103 @@ for e in tqdm(encrypted, ascii=True):
 print(mean(1 if guess == token else 0 for guess, token in zip(guessed_tokens, tokens)))
 
 # %%
+import functools as ft
+import operator
 import torch
-from transformers import GPT2TokenizerFast, GPT2LMHeadModel
-from novelties_bookshare.encrypt import encrypt_token
+from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration
+from novelties_bookshare.encrypt import encrypt_token, encrypt_tokens
+from statistics import mean
+
+
+@ft.lru_cache(maxsize=16)
+def cached_generate(text: str, model, tokenizer):
+    device = torch.device("cuda")
+    encoded_text = tokenizer(text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**encoded_text, logits_to_keep=1)
+    return outputs
+
+
+def token_next_prob(
+    text_so_far: str, token: str, model, tokenizer, max_depth: int = 4
+) -> Optional[float]:
+    subtokens = tokenizer.tokenize(token)
+    subtoken_ids = tokenizer(token, add_special_tokens=False)["input_ids"]
+
+    prob = None
+    probs = []
+    depth = 0
+
+    while prob is None and depth < max_depth:
+        subtoken_id = subtoken_ids[0]
+
+        outputs = cached_generate(text_so_far, model, tokenizer)
+        next_token_logits = outputs.logits[0, -1, :]
+        next_token_probs = torch.softmax(next_token_logits, -1)
+        probs.append(next_token_probs[subtoken_id].item())
+
+        depth += 1
+        text_so_far += subtokens[0]
+        subtokens = subtokens[1:]
+        subtoken_ids = subtoken_ids[1:]
+
+        if len(subtoken_ids) == 0:
+            prob = ft.reduce(operator.mul, probs)
+
+    return prob
 
 
 def next_probs(
-    text_so_far: str, tokens: set[str], model, tokenizer
+    text_so_far: str, tokens: set[str], model, tokenizer, max_depth: int = 4
 ) -> dict[str, float]:
-    device = torch.device("cuda")
-    encoded_text = tokenizer(text_so_far, return_tensors="pt").to(device)
-    with torch.inference_mode():
-        outputs = model(**encoded_text)
-    next_token_logits = outputs.logits[0, -1, :]
-    next_token_probs = torch.softmax(next_token_logits, -1)
-    topk_next_tokens = torch.topk(next_token_probs, 1000)
-    probs = {
-        (tokenizer.decode(idx)): prob.item()
-        for idx, prob in zip(topk_next_tokens.indices, topk_next_tokens.values)
-    }
-    # NOTE: GPT2 adds a space in front of the word. Good luck with
-    # other models... -_-
-    probs = {t[1:]: p for t, p in probs.items()}
-    probs = {t: p for t, p in probs.items() if t in tokens}
+    probs = {}
+    for token in tokens:
+        prob = token_next_prob(
+            text_so_far, token, model, tokenizer, max_depth=max_depth
+        )
+        probs[token] = prob or 0
     return probs
 
 
 def beam_search(
-    start_token: str, guessed_tokens: list[set[str]], model, tokenizer
+    prompt: str, guessed_tokens: list[set[str]], model, tokenizer, beams_nb: int
 ) -> list[str]:
-    beams = []
-    text_so_far = [start_token]
-    for g in tqdm(guessed_tokens):
-        probs = next_probs(" ".join(text_so_far), g, model, tokenizer)
-        next_token = max(g, key=lambda t: probs.get(t, 0))
-        text_so_far.append(next_token)
-    return text_so_far
+    assert beams_nb > 0
+
+    def beam_score(beam: tuple[list[str], list[float]]) -> float:
+        eps = 1e-16
+        return sum([math.log(p + eps) for p in beam[1]])
+
+    def inv_beam_score(beam: tuple[list[str], list[float]]) -> float:
+        return -beam_score(beam)
+
+    probs = next_probs(prompt, guessed_tokens[0], model, tokenizer)
+    # a list of beams, each of the form ([tokens], [scores])
+    beams = [([token], [prob]) for token, prob in probs.items()]
+    beams = sorted(beams, key=inv_beam_score)[:beams_nb]
+
+    for possible_tokens in tqdm(guessed_tokens[1:], ascii=True):
+        new_beams = []
+        for tokens, prob_seq in beams:
+            probs = next_probs(
+                prompt + " " + " ".join(tokens), possible_tokens, model, tokenizer
+            )
+            local_new_beams = [
+                (tokens + [token], prob_seq + [prob]) for token, prob in probs.items()
+            ]
+            local_new_beams = sorted(local_new_beams, key=inv_beam_score)[:beams_nb]
+            new_beams += local_new_beams
+        beams = sorted(new_beams, key=inv_beam_score)[:beams_nb]
+
+    return max(beams, key=beam_score)[0]
 
 
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-model = GPT2LMHeadModel.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+# model = AutoModelForCausalLM.from_pretrained("google/gemma-3-270m")
+# tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m")
+# model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 model = model.to(torch.device("cuda"))
 
 hash_len = 2
@@ -889,17 +946,47 @@ tokens, _ = load_book(corpus[0])
 encrypted = encrypt_tokens(tokens, hash_len=hash_len)
 
 h_voc = {t: encrypt_token(t, hash_len=hash_len) for t in set(tokens)}
-# perfect_dist = freq(tokens)
-# freq_sorted_tokens = list(reversed(sorted(perfect_dist.keys(), key=perfect_dist.get)))
-# freq_sorted_hashs = encrypt_tokens(freq_sorted_tokens, hash_len=hash_len)
 
 guessed_tokens = []
 for e in tqdm(encrypted, ascii=True):
     guessed_tokens.append({t for t, h in h_voc.items() if h == e})
 
-# let's be crazy and give the first token for free
-guessed_tokens = beam_search(tokens[0], guessed_tokens[1:][:1000], model, tokenizer)
+# baseline
+token_freq = freq(tokens)
+print(
+    mean(
+        1 if max(guess, key=token_freq.get) == token else 0
+        for guess, token in zip(guessed_tokens, tokens)
+    )
+)
+
+# let's be crazy and give some starting tokens for free
+start_tokens = tokens[:100]
+llm_guessed_tokens = beam_search(
+    "Complete the following text from 1984: {}".format(" ".join(start_tokens)),
+    guessed_tokens[len(start_tokens) :][:100],
+    model,
+    tokenizer,
+    beams_nb=4,
+)
 
 print(
-    mean(1 if guess == token else 0 for guess, token in zip(guessed_tokens, tokens[1:]))
+    mean(
+        1 if guess == token else 0
+        for guess, token in zip(llm_guessed_tokens, tokens[len(start_tokens) :])
+    )
 )
+
+
+# %%
+import re
+
+
+def get_params(metric_key: str) -> tuple[str, dict[str, str]]:
+    # form of each metric
+    # w=window.e=edition.metric_name
+    m = re.match(r"w=([^\.]+)\.e=([^\.]+)\.(.*)", metric_key)
+    if m is None:
+        return "", {}
+    window, edition, metric_name = m.groups()
+    return metric_name, {"window": window, "edition": edition}
