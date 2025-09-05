@@ -1,0 +1,7750 @@
+# -*- org-hide-emphasis-markers: t; -*-
+#+TITLE: Chiffrer un jeu de données de REN copyrighté
+#+AUTHOR: Arthur Amalvy
+
+
+* Premières expériences
+
+- naive :: aligne les deux séquences de tokens chiffrés en utilisant
+  =difflib=, ne déchiffre que les tokens alignés.
+- advanced :: comme ci-dessus, mais essaye aussi de corriger les
+  deletions/substitutions avec une seconde passe, en vérifiant si un
+  token non donné par l'utilisateur est déchiffré dans la première
+  passe.
+
+
+#+begin_example
+Deletion: L'utilisateur n'a pas fourni un token:
+
+ut1 uh1 = gh1
+ut2 uh2 = gh2
+--- --- = gh1 < deletion
+ut3 uh3 = gh4
+
+On peut retrouver le token original si le hash de réference a été
+déchiffré avant (dans cet exemple, gh1 correspond à ut1 dans la
+première phase d'alignement)
+
+ut1 uh1 = gh1 < déjà déchiffré
+ut2 uh2 = gh2   v
+ut1 uh1 = gh1 < récupéré
+ut3 uh3 = gh4
+
+Le même processus fonctionne pour une substitution.
+#+end_example
+
+
+Nous expérimentons sur le premier chapitre d'Elantris.
+
+** Influence des erreurs: substitution, deletion, addition
+
+[[./plots/sub_del_add.png]]
+
+Notre méthode améliore la performance dans tous les cas.
+
+** Influence de la taille du hash
+
+Réduire la taille du hash cause des collisions. Dans le cas d'une
+deletion/substitution, la strategy =advanced= tente de récupérer le
+token non fourni en cherchant un token décodé avec le même hash. Dans
+l'implémentation actuelle, la stratégie récupère le premier token dans
+ce cas dans la séquence, ce qui pourrait être incorrect si il y a
+collision.
+
+[[./plots/hash_len.png]]
+
+Il semble qu'à partir de ~3 tokens, la taille du hash n'a que peu
+d'influence sur la performance.
+
+** Annexe: code testé
+
+*** ~encrypt_tokens~
+
+#+begin_src python
+@functools.lru_cache
+def encrypt_token(token: str, hash_len: Optional[int] = None) -> str:
+    h = hashlib.sha256()
+    h.update(token.encode("utf-8"))
+    if not hash_len is None:
+        return h.hexdigest()[:hash_len]
+    return h.hexdigest()
+
+
+def encrypt_tokens(tokens: List[str], hash_len: Optional[int] = None) -> List[str]:
+    return [encrypt_token(token, hash_len) for token in tokens]
+#+end_src
+
+*** ~decrypt_tokens_naive~
+
+#+begin_src python
+def decrypt_tokens_naive(
+    encrypted_tokens: list,
+    tags: List[str],
+    user_tokens: List[str],
+    hash_len: Optional[int] = None,
+):
+    assert len(encrypted_tokens) == len(tags)
+
+    decrypted_tokens = ["[UNK]" for _ in encrypted_tokens]
+
+    encrypted_user_tokens = encrypt_tokens(user_tokens, hash_len=hash_len)
+
+    # loop over operations turning encrypted_tokens into
+    # encrypted_user_tokens
+    matcher = difflib.SequenceMatcher(None, encrypted_tokens, encrypted_user_tokens)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        # NOTE: ignores 'insert', 'replace', 'delete'
+        if tag == "equal":
+            decrypted_tokens[i1:i2] = user_tokens[j1:j2]
+
+    assert len(decrypted_tokens) == len(tags)
+    return decrypted_tokens
+#+end_src
+
+*** ~decrypt_tokens~
+
+#+begin_src python
+def decrypt_tokens(
+    encrypted_tokens: list,
+    tags: List[str],
+    user_tokens: List[str],
+    hash_len: Optional[int] = None,
+) -> List[str]:
+    assert len(encrypted_tokens) == len(tags)
+
+    decrypted_tokens = ["[UNK]" for _ in encrypted_tokens]
+
+    encrypted_user_tokens = encrypt_tokens(user_tokens, hash_len=hash_len)
+
+    # loop over operations turning encrypted_tokens into
+    # encrypted_user_tokens
+    matcher = difflib.SequenceMatcher(None, encrypted_tokens, encrypted_user_tokens)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        # NOTE: ignores 'insert', 'replace', 'delete'
+        if tag == "equal":
+            decrypted_tokens[i1:i2] = user_tokens[j1:j2]
+
+    # second pass
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete" or tag == "replace":
+            # the user did not supply some tokens, or supplied a wrong
+            # token. Maybe we did decode some of these tokens before
+            # else and we can use them to retrieve this token.
+            for i, encrypted_token in enumerate(encrypted_tokens[i1:i2]):
+                for h, token in zip(encrypted_tokens, decrypted_tokens):
+                    if h == encrypted_token:
+                        decrypted_tokens[i1 + i] = token
+
+    assert len(decrypted_tokens) == len(tags)
+    return decrypted_tokens
+#+end_src
+
+
+* Points à mentionner dans l'introduction l'article
+
+- Si le texte de l'utilisateur est identique au notre, le problème est
+  trivial (les positions des annotations suffisent ou on peut utiliser
+  le livre comme clé)
+- La tokénisation n'est pas obtenue seulement par un algorithme
+  déterministe, car on ajoute nous mêmes des modifications pour
+  corriger les annotations de NER
+- il faut utiliser une technique de tokénisation avec une granularité
+  "similaire"
+
+
+* Seconde expérience
+
+** Influence des erreurs: =token_split=, =token_merge=, =ocr=
+
+Nous testons sur un livre entier : 1984 en anglais. Nous ajoutons
+trois dégradations supplémentaires:
+
+- token_split :: découpe en deux d'un token
+- token_merge :: regroupement de deux tokens
+- ocr :: simulation d'erreurs OCR avec
+  https://github.com/JonnoB/scrambledtext
+
+[[./plots/degradations.jpg]]
+
+
+* Troisièmes expériences : implémentation de stratégies supplémentaires
+
+** Implémentation de la stratégie =splice=
+
+On souhaite corriger les erreurs dues à la tokenization. Par exemple:
+
+#+begin_example
+ref  user
+---  ----
+e1   e1
+e2   e2e3 < substitution
+e3   -
+e4   e4
+#+end_example
+
+Dans ce cas, le tokenizer de l'utilisateur a fusionné les tokens
+e2/e3. Il est tout même possible de récupérer ces tokens en testant
+toutes les combinaisons possibles de splits de la chaine e2e3. Par
+exemple:
+
+#+begin_example
+tokens originaux                         : ["Lianna", "princesse", "de", "Fomalhaut"]
+tokens utilisateurs                      : ["Lianna", "princessede", "Fomalhaut"]
+sortie de la stratégie naive             : ["Lianna", "[UNK]", "[UNK]", "Fomalhaut"]
+sortie en ajoutant la stratégie =splice= : ["Lianna", "princesse", "de", "Fomalhaut"]
+#+end_example
+
+Cette stratégie fonctionne aussi en cas de division erronée :
+
+#+begin_example
+ref  user
+---  ----
+e1    e1
+e2e3  e2 < substitution
+-     e3
+e4    e4
+#+end_example
+
+En effet, dans ce cas, la substitution concerne les deux tokens
+utilisateurs e2 et e3. La stratégie les regroupe (e2e3) et tente
+toutes les combinaisons possibles de splits de cette chaine.
+
+Par exemple :
+
+#+begin_example
+tokens originaux                         : ["Lianna", "princesse", "de", "Fomalhaut"]
+tokens utilisateurs                      : ["Lianna", "princ", "esse", "de", "Fomalhaut"]
+sortie de la stratégie naive             : ["Lianna", "[UNK]", "de", "Fomalhaut"]
+sortie en ajoutant la stratégie =splice= : ["Lianna", "princesse", "de", "Fomalhaut"]
+#+end_example
+
+*** Implémentation Python
+
+#+begin_src python
+def decryptplugin_splice(
+    matcher: difflib.SequenceMatcher,
+    user_tokens: list[str],
+    decrypted_tokens: list[str],
+    encrypted_tokens: list[str],
+    hash_len: Optional[int],
+) -> list[str]:
+    """Fix incorrect user token merging.
+
+    In the case of a tokenization error, a word can be incorrectly
+    merged on the side of the user.  For example:
+
+    .. example::
+
+        ref  user
+        ---  ----
+        e1   e1
+        e2   e2-e3 < substitution
+        e3   -
+        e4   e4
+
+    In that case, we have a substitution.  We can try all possible
+    splits of the merged tokens.  This also works in the reverse case:
+
+    .. example::
+
+        ref  user
+        ---  ----
+        e1    e1
+        e2-e3 e2 < substitution
+        -     e3
+        e4    e4
+
+    """
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace":
+            continue
+
+        # we will try different splits of the tokens to see if they
+        # match the substituted tokens in encrypted_tokens
+        tokens_to_split = "".join(user_tokens[j1:j2])
+
+        # we compute the number of substituted tokens: this will be
+        # our number of splits
+        sub_len = i2 - i1
+
+        for split in strksplit(tokens_to_split, sub_len):
+            encrypted_split = encrypt_tokens(split, hash_len=hash_len)
+            if encrypted_split == encrypted_tokens[i1:i2]:
+                decrypted_tokens[i1:i2] = split
+                break
+
+    return decrypted_tokens
+#+end_src
+
+
+** Implémentation de la stratégie =mlm=
+
+On souhaite corriger le cas où l'utilisateur n'a pas fourni un token
+en prédisant celui-ci avec un modèle de langue (masked language
+modelling).
+
+1. Le modèle prédit une liste de candidat possible pour ce token masqué
+2. Si la version chiffrée de l'un de ces candidates est identique au
+   token original chiffré, le token est récupéré
+
+
+#+begin_example
+tokens originaux                      : ['I', 'am', 'your', 'father', 'Luke', '!', ',', 'said', 'Vader']
+tokens utilisateurs                   : ['I', 'am', 'your', 'Luke', '!', ',', 'said', 'Vader']
+sortie de la stratégie naive          : ['I', 'am', 'your', '[UNK]', 'Luke', '!', ',', 'said', 'Vader']
+sortie en ajoutant la stratégie =mlm= : ['I', 'am', 'your', 'father', 'Luke', '!', ',', 'said', 'Vader']
+#+end_example
+
+*** Implémentation Python
+
+#+begin_src python
+def decryptplugin_mlm(
+    matcher: difflib.SequenceMatcher,
+    user_tokens: list[str],
+    decrypted_tokens: list[str],
+    encrypted_tokens: list[str],
+    hash_len: Optional[int],
+    pipeline,
+    window: int,
+) -> list[str]:
+    """
+    ref  user
+    ---  ----
+    e1    e1
+    e2    - < deletion
+    e3    e3
+    e4    e4
+    """
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        # TODO: can we fix replace too??
+        if tag == "replace" or tag == "delete":
+            # the user did not supply some tokens, or supplied a wrong
+            # token. In that case, we try to decode the token using BERT
+            for i in range(i2 - i1):
+                X = decrypted_tokens[i1 + i - window : i1 + i + window]
+                assert not "[MASK]" in X
+                X[i1 + i] = "[MASK]"  # mask the central token
+                X = " ".join(X)  # pipeline expects a string
+                # pick the probable token whose encrypted form match
+                # the encrypted gold token
+                candidates: list[dict] = pipeline(X)
+                print([c["sequence"] for c in candidates])
+                for cand in candidates:
+                    cand = cand["token_str"].strip(" ")
+                    encrypted_cand = encrypt_token(cand, hash_len)
+                    if encrypted_cand == encrypted_tokens[i1 + i]:
+                        decrypted_tokens[i1 + i] = cand
+
+    return decrypted_tokens
+#+end_src
+
+** Séquences de stratégie
+
+Il est possible de d'appliquer séquentiellement des stratégies de
+déchiffrement. Par exemple, on peut appliquer la stratégie =splice=
+pour déchiffrer plus de tokens, ce qui peut être utile ensuite pour la
+stratégie =propagate=.
+
+** Expérience
+
+Configuration : 1000 premiers tokens de /1984/
+
+*** Résultats
+
+[[./plots/strategies_comparison_add-del-sub.png]]
+
+[[./plots/strategies_comparison_ocr.png]]
+
+[[./plots/strategies_comparison_tokenization.png]]
+
+- les =ajouts= ne sont pas problématiques
+- la stratégie =splice= est spécialisée dans les problèmes de
+  tokénisation : elle n'améliore pas la performance face à d'autres
+  dégradations mais est très performante dans le cas d'une dégradation
+  =token_merge=
+- appliquer séquentiellement les stratégies est bénéfique dans
+  quasiment tous les cas
+
+
+* Constitution d'un corpus de test
+
+1. Un corpus de livres pour tester les perturbations synthétiques
+2. Un corpus avec des versions différentes des livres
+
+
+** Livres complet Novelties
+
+| Novel                       | Copyrighted? |
+|-----------------------------+--------------|
+| 1984                        | No           |
+| Bel_Ami                     | No           |
+| Brave_New_World             | Yes          |
+| Eugenie_Grandet             | No           |
+| Germinal                    | No           |
+| Madame_Bovary               | No           |
+| Moby_Dick                   | No           |
+| The_Black_Company           | Yes          |
+| The_Blade_Itself            | Yes          |
+| The_Colour_Of_Magic         | Yes          |
+| The_Hunchback_of_Notre-Dame | No           |
+| The_Light_Fantastic         | Yes          |
+| The_Red_And_The_Black       | No           |
+| The_Three_Musketeers        | No           |
+
+
+** Corpus de test pour les perturbations synthétiques
+
+On se limite aux livres copyrightés pour des raisons de temps de calcul
+
+| Novel               |
+|---------------------|
+| Brave_New_World     |
+| The_Black_Company   |
+| The_Blade_Itself    |
+| The_Colour_Of_Magic |
+| The_Light_Fantastic |
+
+
+*** Résultats
+
+Les expériences sont longues ! ~7h30
+
+**** Impact du livre
+
+La performance entre les différents livres est très similaire.
+
+- [[./plots/full_books/perbook_naive.png]]
+- [[./plots/full_books/perbook_propagate.png]]
+- [[./plots/full_books/perbook_splice.png]]
+- [[./plots/full_books/perbook_mlm.png]]
+- [[./plots/full_books/perbook_splice->mlm->propagate.png]]
+
+
+**** Impact de la stratégie
+
+On retrouve nos résultats sur des corpus réduits :
+
+- les ajouts ne sont pas problématiques
+- la stratégie =splice= est meilleure pour les problèmes de tokénisation =token_merge=
+- appliquer séquentiellement les stratégies est bénéfique en général
+
+- [[./plots/full_books/perstrat_Brave_New_World.png]]
+- [[./plots/full_books/perstrat_The_Black_Company.png]]
+- [[./plots/full_books/perstrat_The_Blade_Itself.png]]
+- [[./plots/full_books/perstrat_The_Colour_Of_Magic.png]]
+- [[./plots/full_books/perstrat_The_Light_Fantastic.png]]
+
+** Corpus de test pour la différence entre éditions
+
+On se concentre sur Brave New World, qui a plusieurs éditions ebooks.
+
+| Code | ISBN (10 digits) | ISBN (13 digits) | Éditeur        | Anné de publication | Problèmes                            |
+|------+------------------+------------------+----------------+---------------------+--------------------------------------|
+| HC98 |       0060929871 |    9780060929879 | Harper Collins |                1998 |                                      |
+| HC04 |       0060535261 |    9780060535261 | Harper Collins |                2004 |                                      |
+| HC06 |       0060850523 |    9780060850524 | Harper Collins |                2006 | Première lettre du chapitre détachée |
+| RB06 |       0795311249 |    9780795311246 | Rosetta Books  |                2006 |                                      |
+
+*** Extraction des fichiers conll
+
+1. Téléchargement des epubs depuis libgen
+2. Export .txt avec Calibre
+3. Pour chaque livre : nettoyage, découpage en chapitre, conversion en .conll
+   1. HC98 ::
+      1. manually clean up header (title, author, ---)
+      2. ~python ~/Dev/Novelties/src/split_into_chapters.py -r '\nChapter [a-zA-Z]+\n' -i ~/Calibre\ Library/Aldous\ Huxley/Brave\ New\ World\ \(6\)/Brave\ New\ World\ -\ Aldous\ Huxley.txt -o ~/Calibre\ Library/Aldous\ Huxley/Brave\ New\ World\ \(6\)~
+      3. ~python txt_to_conll.py -i ~/Calibre\ Library/Aldous\ Huxley/Brave\ New\ World\ \(6\)/chapter_*.txt -l eng -t 'Brave New World' -v v1.0.0~
+   2. HC04 ::
+      1. manually clean up header (title, author)
+      2. ~python split_into_chapters.py -r '\nChapter [a-zA-Z]+\n' -i ~/Calibre\ Library/Aldous\ Huxley/Brave\ new\ world\ \(4\)/Brave\ new\ world\ -\ Aldous\ Huxley.txt -o ~/Calibre\ Library/Aldous\ Huxley/Brave\ new\ world\ \(4\)~
+      3. ~python txt_to_conll.py -i ~/Calibre\ Library/Aldous\ Huxley/Brave\ new\ world\ \(4\)/chapter_*.txt -l eng -t 'Brave New World' -v v1.0.0~
+   3. HC06 ::
+      1. manually clean up header (title)
+      2. ~python split_into_chapters.py -r '\nChapter [a-zA-Z]+\n' -i ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(5\)/Brave\ New\ World\ -\ Huxley,\ Aldous.txt -o ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(5\)~
+      3. ~python txt_to_conll.py -i ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(5\)/chapter_*.txt -l eng -t 'Brave New World' -v v1.0.0~
+   4. RB06 ::
+      1. manually clean up header (title, copyright, toc, foreword)
+      2. ~python split_into_chapters.py -r '\n[0-9]+\n\n\n\n\n' -i ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(2\)/Brave\ New\ World\ -\ Huxley,\ Aldous.txt -o ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(2\)~
+      3. ~python txt_to_conll.py -i ~/Calibre\ Library/Huxley,\ Aldous/Brave\ New\ World\ \(2\)/chapter_*.conll -l eng -t 'Brave New World' -v v1.0.0~
+
+
+
+*** Diff du chapitre 1, par édition
+
+On affiche la différence entre les tokens uniquement : 
+
+#+begin_src sh
+tail -n +8 chapter_1.conll | awk '{print $1;}'
+#+end_src
+
+**** HC98
+
+Problèmes :
+
+- capitalisation :: =squat -> SQUAT=
+- guillemets :: =`` -> "=, ='' -> ""=
+  - note: pas du tout normalisé dans Novelties...
+- encodage :: =intelligently–though -> intelligently�though=
+- points de suspension :: =… -> ...=
+- tokénisation :: =A.F. -> A. F.=, =D.H.C. -> D.H.C .=, =Mr. -> Mr .=
+- Trailer de fin de chapitre :: =∅ -> -----=
+
+#+begin_src diff
+diff -u --label \#\<buffer\ chapter_1_tokens.txt\<Brave_New_World\>\> --label \#\<buffer\ chapter_1_tokens.txt\<HC98\>\> /tmp/buffer-content-O5YNW8 /tmp/buffer-content-Yed1Jo
+--- #<buffer chapter_1_tokens.txt<Brave_New_World>>
++++ #<buffer chapter_1_tokens.txt<HC98>>
+@@ -1,5 +1,5 @@
+ A
+-squat
++SQUAT
+ grey
+ building
+ of
+@@ -178,11 +178,11 @@
+ work
+ tables
+ .
+-``
++"
+ And
+ this
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -190,13 +190,13 @@
+ the
+ door
+ ,
+-``
++"
+ is
+ the
+ Fertilizing
+ Room
+ .
+-''
++"
+ Bent
+ over
+ their
+@@ -318,7 +318,7 @@
+ various
+ departments
+ .
+-``
++"
+ Just
+ to
+ give
+@@ -327,7 +327,7 @@
+ general
+ idea
+ ,
+-''
++"
+ he
+ would
+ explain
+@@ -353,7 +353,7 @@
+ do
+ their
+ work
+-intelligently–though
++intelligently�though
+ as
+ little
+ of
+@@ -407,10 +407,10 @@
+ of
+ society
+ .
+-``
++"
+ To-morrow
+ ,
+-''
++"
+ he
+ would
+ add
+@@ -424,7 +424,7 @@
+ menacing
+ geniality
+ ,
+-``
++"
+ you
+ 'll
+ be
+@@ -443,8 +443,8 @@
+ generalities
+ .
+ Meanwhile
+-…
+-''
++...
++"
+ Meanwhile
+ ,
+ it
+@@ -540,7 +540,8 @@
+ of
+ stability
+ ,
+-A.F.
++A.
++F.
+ 632
+ ,
+ it
+@@ -553,7 +554,7 @@
+ ask
+ it
+ .
+-``
++"
+ I
+ shall
+ begin
+@@ -561,10 +562,11 @@
+ the
+ beginning
+ ,
+-''
++"
+ said
+ the
+-D.H.C.
++D.H.C
++.
+ and
+ the
+ more
+@@ -582,21 +584,21 @@
+ the
+ beginning
+ .
+-``
++"
+ These
+ ,
+-''
++"
+ he
+ waved
+ his
+ hand
+ ,
+-``
++"
+ are
+ the
+ incubators
+ .
+-''
++"
+ And
+ opening
+ an
+@@ -612,7 +614,7 @@
+ numbered
+ test-tubes
+ .
+-``
++"
+ The
+ week
+ 's
+@@ -622,11 +624,11 @@
+ .
+ Kept
+ ,
+-''
++"
+ he
+ explained
+ ,
+-``
++"
+ at
+ blood
+ heat
+@@ -636,7 +638,7 @@
+ male
+ gametes
+ ,
+-''
++"
+ and
+ here
+ he
+@@ -644,7 +646,7 @@
+ another
+ door
+ ,
+-``
++"
+ they
+ have
+ to
+@@ -661,7 +663,7 @@
+ heat
+ sterilizes
+ .
+-''
++"
+ Rams
+ wrapped
+ in
+@@ -706,8 +708,8 @@
+ of
+ its
+ surgical
+-introduction–
+-''
++introduction�
++"
+ the
+ operation
+ undergone
+@@ -734,7 +736,7 @@
+ months
+ '
+ salary
+-''
++"
+ ;
+ continued
+ with
+@@ -861,7 +863,7 @@
+ bouillon
+ containing
+ free-swimming
+-spermatozoa–at
++spermatozoa�at
+ a
+ minimum
+ concentration
+@@ -962,12 +964,12 @@
+ 's
+ Process
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+ ,
+-''
++"
+ repeated
+ the
+ Director
+@@ -1043,15 +1045,16 @@
+ .
+ Progress
+ .
+-``
++"
+ Essentially
+ ,
+-''
++"
+ the
+-D.H.C.
++D.H.C
++.
+ concluded
+ ,
+-``
++"
+ bokanovskification
+ consists
+ of
+@@ -1078,7 +1081,7 @@
+ by
+ budding
+ .
+-''
++"
+ Responds
+ by
+ budding
+@@ -1229,18 +1232,18 @@
+ again
+ and
+ having
+-budded–bud
++budded�bud
+ out
+ of
+ bud
+ out
+ of
+-bud–were
+-thereafter–further
++bud�were
++thereafter�further
+ arrest
+ being
+ generally
+-fatal–left
++fatal�left
+ to
+ develop
+ in
+@@ -1264,7 +1267,7 @@
+ eight
+ to
+ ninety-six
+-embryos–
++embryos�
+ a
+ prodigious
+ improvement
+@@ -1277,7 +1280,7 @@
+ nature
+ .
+ Identical
+-twins–but
++twins�but
+ not
+ in
+ piddling
+@@ -1309,10 +1312,10 @@
+ a
+ time
+ .
+-``
++"
+ Scores
+ ,
+-''
++"
+ the
+ Director
+ repeated
+@@ -1329,10 +1332,10 @@
+ distributing
+ largesse
+ .
+-``
++"
+ Scores
+ .
+-''
++"
+ But
+ one
+ of
+@@ -1348,12 +1351,12 @@
+ advantage
+ lay
+ .
+-``
++"
+ My
+ good
+ boy
+ !
+-''
++"
+ The
+ Director
+ wheeled
+@@ -1362,7 +1365,7 @@
+ on
+ him
+ .
+-``
++"
+ Ca
+ n't
+ you
+@@ -1373,7 +1376,7 @@
+ you
+ see
+ ?
+-''
++"
+ He
+ raised
+ a
+@@ -1384,7 +1387,7 @@
+ was
+ solemn
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+@@ -1398,7 +1401,7 @@
+ social
+ stability
+ !
+-''
++"
+ Major
+ instruments
+ of
+@@ -1430,7 +1433,7 @@
+ bokanovskified
+ egg
+ .
+-``
++"
+ Ninety-six
+ identical
+ twins
+@@ -1439,7 +1442,7 @@
+ identical
+ machines
+ !
+-''
++"
+ The
+ voice
+ was
+@@ -1448,7 +1451,7 @@
+ with
+ enthusiasm
+ .
+-``
++"
+ You
+ really
+ know
+@@ -1463,25 +1466,25 @@
+ in
+ history
+ .
+-''
++"
+ He
+ quoted
+ the
+ planetary
+ motto
+ .
+-``
++"
+ Community
+ ,
+ Identity
+ ,
+ Stability
+ .
+-''
++"
+ Grand
+ words
+ .
+-``
++"
+ If
+ we
+ could
+@@ -1494,7 +1497,7 @@
+ be
+ solved
+ .
+-''
++"
+ Solved
+ by
+ standard
+@@ -1522,26 +1525,26 @@
+ to
+ biology
+ .
+-``
++"
+ But
+ ,
+ alas
+ ,
+-''
++"
+ the
+ Director
+ shook
+ his
+ head
+ ,
+-``
++"
+ we
+ ca
+ n't
+ bokanovskify
+ indefinitely
+ .
+-''
++"
+ Ninety-six
+ seemed
+ to
+@@ -1574,7 +1577,7 @@
+ identical
+ twins
+ as
+-possible–that
++possible�that
+ was
+ the
+ best
+@@ -1595,7 +1598,7 @@
+ was
+ difficult
+ .
+-``
++"
+ For
+ in
+ nature
+@@ -1635,7 +1638,7 @@
+ quarter
+ of
+ a
+-century–what
++century�what
+ would
+ be
+ the
+@@ -1643,7 +1646,7 @@
+ of
+ that
+ ?
+-''
++"
+ Obviously
+ ,
+ no
+@@ -1682,13 +1685,13 @@
+ .
+ Fertilize
+ and
+-bokanovskify–in
++bokanovskify�in
+ other
+ words
+ ,
+ multiply
+ by
+-seventy-two–and
++seventy-two�and
+ you
+ get
+ an
+@@ -1719,7 +1722,7 @@
+ same
+ age
+ .
+-``
++"
+ And
+ in
+ exceptional
+@@ -1737,7 +1740,7 @@
+ adult
+ individuals
+ .
+-''
++"
+ Beckoning
+ to
+ a
+@@ -1755,11 +1758,11 @@
+ the
+ moment
+ .
+-``
++"
+ Mr.
+ Foster
+ ,
+-''
++"
+ he
+ called
+ .
+@@ -1769,7 +1772,7 @@
+ man
+ approached
+ .
+-``
++"
+ Can
+ you
+ tell
+@@ -1781,11 +1784,12 @@
+ single
+ ovary
+ ,
+-Mr.
++Mr
++.
+ Foster
+ ?
+-''
+-``
++"
++"
+ Sixteen
+ thousand
+ and
+@@ -1794,7 +1798,7 @@
+ this
+ Centre
+ ,
+-''
++"
+ Mr.
+ Foster
+ replied
+@@ -1821,7 +1825,7 @@
+ quoting
+ figures
+ .
+-``
++"
+ Sixteen
+ thousand
+ and
+@@ -1845,12 +1849,12 @@
+ much
+ better
+ ,
+-''
++"
+ he
+ rattled
+ on
+ ,
+-``
++"
+ in
+ some
+ of
+@@ -1914,7 +1918,7 @@
+ .
+ Still
+ ,
+-''
++"
+ he
+ added
+ ,
+@@ -1941,7 +1945,7 @@
+ challenging
+ )
+ ,
+-``
++"
+ still
+ ,
+ we
+@@ -1996,8 +2000,8 @@
+ them
+ yet
+ .
+-''
+-``
++"
++"
+ That
+ 's
+ the
+@@ -2005,7 +2009,7 @@
+ I
+ like
+ !
+-''
++"
+ cried
+ the
+ Director
+@@ -2018,7 +2022,7 @@
+ the
+ shoulder
+ .
+-``
++"
+ Come
+ along
+ with
+@@ -2035,17 +2039,17 @@
+ expert
+ knowledge
+ .
+-''
++"
+ Mr.
+ Foster
+ smiled
+ modestly
+ .
+-``
++"
+ With
+ pleasure
+ .
+-''
++"
+ They
+ went
+ .
+@@ -2214,7 +2218,7 @@
+ solution
+ poured
+ in
+-…
++...
+ and
+ already
+ the
+@@ -2240,9 +2244,7 @@
+ membership
+ of
+ Bokanovsky
+-Group
+-–
+-details
++Group�details
+ were
+ transferred
+ from
+@@ -2281,14 +2283,14 @@
+ Predestination
+ Room
+ .
+-``
++"
+ Eighty-eight
+ cubic
+ metres
+ of
+ card-index
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2299,19 +2301,19 @@
+ they
+ entered
+ .
+-``
++"
+ Containing
+ all
+ the
+ relevant
+ information
+ ,
+-''
++"
+ added
+ the
+ Director
+ .
+-``
++"
+ Brought
+ up
+ to
+@@ -2319,15 +2321,15 @@
+ every
+ morning
+ .
+-''
+-``
++"
++"
+ And
+ co-ordinated
+ every
+ afternoon
+ .
+-''
+-``
++"
++"
+ On
+ the
+ basis
+@@ -2338,8 +2340,8 @@
+ their
+ calculations
+ .
+-''
+-``
++"
++"
+ So
+ many
+ individuals
+@@ -2350,12 +2352,12 @@
+ such
+ quality
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ .
+-``
++"
+ Distributed
+ in
+ such
+@@ -2363,8 +2365,8 @@
+ such
+ quantities
+ .
+-''
+-``
++"
++"
+ The
+ optimum
+ Decanting
+@@ -2374,24 +2376,24 @@
+ given
+ moment
+ .
+-''
+-``
++"
++"
+ Unforeseen
+ wastages
+ promptly
+ made
+ good
+ .
+-''
+-``
++"
++"
+ Promptly
+ ,
+-''
++"
+ repeated
+ Mr.
+ Foster
+ .
+-``
++"
+ If
+ you
+ knew
+@@ -2410,7 +2412,7 @@
+ Japanese
+ earthquake
+ !
+-''
++"
+ He
+ laughed
+ goodhumouredly
+@@ -2419,7 +2421,7 @@
+ his
+ head
+ .
+-``
++"
+ The
+ Predestinators
+ send
+@@ -2430,8 +2432,8 @@
+ the
+ Fertilizers
+ .
+-''
+-``
++"
++"
+ Who
+ give
+ them
+@@ -2441,8 +2443,8 @@
+ ask
+ for
+ .
+-''
+-``
++"
++"
+ And
+ the
+ bottles
+@@ -2455,8 +2457,8 @@
+ in
+ detail
+ .
+-''
+-``
++"
++"
+ After
+ which
+ they
+@@ -2468,15 +2470,15 @@
+ Embryo
+ Store
+ .
+-''
+-``
++"
++"
+ Where
+ we
+ now
+ proceed
+ ourselves
+ .
+-''
++"
+ And
+ opening
+ a
+@@ -2526,14 +2528,14 @@
+ the
+ day
+ .
+-``
++"
+ Embryos
+ are
+ like
+ photograph
+ film
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2547,7 +2549,7 @@
+ second
+ door
+ .
+-``
++"
+ They
+ can
+ only
+@@ -2555,7 +2557,7 @@
+ red
+ light
+ .
+-''
++"
+ And
+ in
+ effect
+@@ -2639,7 +2641,7 @@
+ the
+ air
+ .
+-``
++"
+ Give
+ them
+ a
+@@ -2649,7 +2651,7 @@
+ Mr.
+ Foster
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -2852,21 +2854,21 @@
+ Room
+ .
+ Independent
+-existence–so
++existence�so
+ called
+ .
+-``
++"
+ But
+ in
+ the
+ interval
+ ,
+-''
++"
+ Mr.
+ Foster
+ concluded
+ ,
+-``
++"
+ we
+ 've
+ managed
+@@ -2884,7 +2886,7 @@
+ great
+ deal
+ .
+-''
++"
+ His
+ laugh
+ was
+@@ -2892,7 +2894,7 @@
+ and
+ triumphant
+ .
+-``
++"
+ That
+ 's
+ the
+@@ -2900,14 +2902,14 @@
+ I
+ like
+ ,
+-''
++"
+ said
+ the
+ Director
+ once
+ more
+ .
+-``
++"
+ Let
+ 's
+ walk
+@@ -2918,10 +2920,11 @@
+ them
+ everything
+ ,
+-Mr.
++Mr
++.
+ Foster
+ .
+-''
++"
+ Mr.
+ Foster
+ duly
+@@ -3060,7 +3063,7 @@
+ troublesome
+ tendency
+ to
+-anæmia
++an�a
+ ,
+ to
+ the
+@@ -3126,12 +3129,12 @@
+ of
+ the
+ so-called
+-``
++"
+ trauma
+ of
+ decanting
+ ,
+-''
++"
+ and
+ enumerated
+ the
+@@ -3173,7 +3176,7 @@
+ the
+ system
+ of
+-labelling–a
++labelling�a
+ T
+ for
+ the
+@@ -3203,17 +3206,17 @@
+ white
+ ground
+ .
+-``
++"
+ For
+ of
+ course
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ in
+ the
+ vast
+@@ -3232,7 +3235,7 @@
+ ovary
+ in
+ twelve
+-hundred–that
++hundred�that
+ would
+ really
+ be
+@@ -3305,19 +3308,19 @@
+ 're
+ decanted
+ as
+-freemartins–structurally
++freemartins�structurally
+ quite
+ normal
+ (
+ except
+ ,
+-''
++"
+ he
+ had
+ to
+ admit
+ ,
+-``
++"
+ that
+ they
+ do
+@@ -3342,12 +3345,12 @@
+ at
+ last
+ ,
+-''
++"
+ continued
+ Mr.
+ Foster
+ ,
+-``
++"
+ out
+ of
+ the
+@@ -3368,7 +3371,7 @@
+ human
+ invention
+ .
+-''
++"
+ He
+ rubbed
+ his
+@@ -3395,7 +3398,7 @@
+ do
+ that
+ .
+-``
++"
+ We
+ also
+ predestine
+@@ -3422,35 +3425,36 @@
+ workers
+ or
+ future
+-…
+-''
++...
++"
+ He
+ was
+ going
+ to
+ say
+-``
++"
+ future
+ World
+ controllers
+ ,
+-''
++"
+ but
+ correcting
+ himself
+ ,
+ said
+-``
++"
+ future
+ Directors
+ of
+ Hatcheries
+ ,
+-''
++"
+ instead
+ .
+ The
+-D.H.C.
++D.H.C
++.
+ acknowledged
+ the
+ compliment
+@@ -3507,7 +3511,7 @@
+ Down
+ ,
+ down
+-…
++...
+ A
+ final
+ twist
+@@ -3541,7 +3545,7 @@
+ next
+ pump
+ .
+-``
++"
+ Reducing
+ the
+ number
+@@ -3550,12 +3554,12 @@
+ per
+ minute
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ The
+ surrogate
+ goes
+@@ -3588,14 +3592,14 @@
+ below
+ par
+ .
+-''
++"
+ Again
+ he
+ rubbed
+ his
+ hands
+ .
+-``
++"
+ But
+ why
+ do
+@@ -3608,16 +3612,16 @@
+ below
+ par
+ ?
+-''
++"
+ asked
+ an
+ ingenuous
+ student
+ .
+-``
++"
+ Ass
+ !
+-''
++"
+ said
+ the
+ Director
+@@ -3627,7 +3631,7 @@
+ long
+ silence
+ .
+-``
++"
+ Has
+ n't
+ it
+@@ -3650,7 +3654,7 @@
+ Epsilon
+ heredity
+ ?
+-''
++"
+ It
+ evidently
+ had
+@@ -3665,24 +3669,24 @@
+ with
+ confusion
+ .
+-``
++"
+ The
+ lower
+ the
+ caste
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ the
+ shorter
+ the
+ oxygen
+ .
+-''
++"
+ The
+ first
+ organ
+@@ -3714,7 +3718,7 @@
+ eyeless
+ monsters
+ .
+-``
++"
+ Who
+ are
+ no
+@@ -3722,7 +3726,7 @@
+ at
+ all
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+@@ -3759,12 +3763,12 @@
+ to
+ Society
+ !
+-``
++"
+ Consider
+ the
+ horse
+ .
+-''
++"
+ They
+ considered
+ it
+@@ -3811,19 +3815,19 @@
+ human
+ intelligence
+ .
+-``
++"
+ But
+ in
+ Epsilons
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ very
+ justly
+ ,
+-``
++"
+ we
+ do
+ n't
+@@ -3831,7 +3835,7 @@
+ human
+ intelligence
+ .
+-''
++"
+ Did
+ n't
+ need
+@@ -3899,10 +3903,10 @@
+ the
+ Community
+ !
+-``
++"
+ Enormous
+ !
+-''
++"
+ murmured
+ the
+ students
+@@ -4138,11 +4142,11 @@
+ metres
+ wide
+ .
+-``
++"
+ Heat
+ conditioning
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4215,7 +4219,7 @@
+ their
+ bodies
+ .
+-``
++"
+ We
+ condition
+ them
+@@ -4224,12 +4228,12 @@
+ on
+ heat
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+ .
+-``
++"
+ Our
+ colleagues
+ upstairs
+@@ -4240,19 +4244,19 @@
+ love
+ it
+ .
+-''
+-``
++"
++"
+ And
+ that
+ ,
+-''
++"
+ put
+ in
+ the
+ Director
+ sententiously
+ ,
+-``
++"
+ that
+ is
+ the
+@@ -4260,7 +4264,7 @@
+ of
+ happiness
+ and
+-virtue–liking
++virtue�liking
+ what
+ you
+ 've
+@@ -4282,7 +4286,7 @@
+ social
+ destiny
+ .
+-''
++"
+ In
+ a
+ gap
+@@ -4324,12 +4328,12 @@
+ in
+ silence
+ .
+-``
++"
+ Well
+ ,
+ Lenina
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4372,27 +4376,27 @@
+ uncommonly
+ pretty
+ .
+-``
++"
+ Henry
+ !
+-''
++"
+ Her
+ smile
+ flashed
+ redly
+ at
+-him–a
++him�a
+ row
+ of
+ coral
+ teeth
+ .
+-``
++"
+ Charming
+ ,
+ charming
+ ,
+-''
++"
+ murmured
+ the
+ Director
+@@ -4416,14 +4420,14 @@
+ for
+ himself
+ .
+-``
++"
+ What
+ are
+ you
+ giving
+ them
+ ?
+-''
++"
+ asked
+ Mr.
+ Foster
+@@ -4434,7 +4438,7 @@
+ very
+ professional
+ .
+-``
++"
+ Oh
+ ,
+ the
+@@ -4444,8 +4448,8 @@
+ sleeping
+ sickness
+ .
+-''
+-``
++"
++"
+ Tropical
+ workers
+ start
+@@ -4455,7 +4459,7 @@
+ Metre
+ 150
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+@@ -4463,7 +4467,7 @@
+ the
+ students
+ .
+-``
++"
+ The
+ embryos
+ still
+@@ -4481,7 +4485,7 @@
+ 's
+ diseases
+ .
+-''
++"
+ Then
+ ,
+ turning
+@@ -4489,7 +4493,7 @@
+ to
+ Lenina
+ ,
+-``
++"
+ Ten
+ to
+ five
+@@ -4499,19 +4503,19 @@
+ this
+ afternoon
+ ,
+-''
++"
+ he
+ said
+ ,
+-``
++"
+ as
+ usual
+ .
+-''
+-``
++"
++"
+ Charming
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -4592,7 +4596,7 @@
+ constant
+ rotation
+ .
+-``
++"
+ To
+ improve
+ their
+@@ -4600,12 +4604,12 @@
+ of
+ balance
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ Doing
+ repairs
+ on
+@@ -4676,17 +4680,17 @@
+ their
+ heads
+ .
+-``
++"
+ And
+ now
+ ,
+-''
++"
+ Mr.
+ Foster
+ went
+ on
+ ,
+-``
++"
+ I
+ 'd
+ like
+@@ -4717,7 +4721,7 @@
+ Gallery
+ level
+ ,
+-''
++"
+ he
+ called
+ to
+@@ -4734,7 +4738,7 @@
+ ground
+ floor
+ .
+-``
++"
+ They
+ 're
+ round
+@@ -4742,11 +4746,11 @@
+ Metre
+ 900
+ ,
+-''
++"
+ he
+ explained
+ .
+-``
++"
+ You
+ ca
+ n't
+@@ -4767,7 +4771,7 @@
+ Follow
+ me
+ .
+-''
++"
+ But
+ the
+ Director
+@@ -4777,16 +4781,16 @@
+ his
+ watch
+ .
+-``
++"
+ Ten
+ to
+ three
+ ,
+-''
++"
+ he
+ said
+ .
+-``
++"
+ No
+ time
+ for
+@@ -4814,13 +4818,13 @@
+ afternoon
+ sleep
+ .
+-''
++"
+ Mr.
+ Foster
+ was
+ disappointed
+ .
+-``
++"
+ At
+ least
+ one
+@@ -4830,24 +4834,41 @@
+ Decanting
+ Room
+ ,
+-''
++"
+ he
+ pleaded
+ .
+-``
++"
+ Very
+ well
+ then
+ .
+-''
++"
+ The
+ Director
+ smiled
+ indulgently
+ .
+-``
++"
+ Just
+ one
+ glance
+ .
+-''
++"
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++--
++-
+
+Diff finished.  Fri Jun 27 13:31:38 2025
+#+end_src
+
+**** HC04
+
+Problèmes :
+
+- capitalisation :: =squat -> SQUAT=
+- guillemets :: =`` -> "=, ='' -> ""=
+- OCR typos ? :: =virtue -> virture=, =shoulder -> shouder=, =Director -> Dhector=, =well-being -> weli-being=
+- tokénisation :: =A.F. -> A. F.=, =D.H.C. -> D.H.C .=, =Mr. -> Mr .=, =Group - details -> Group-details=
+- texte manquant ! :: =racks upon racks of numbered test-tubes. ``The week's supply of ova. Kept,'' he -> ∅=
+- editorial choices ? :: =fret-sawyers -> fretsawyers=, =anæmia -> anaemia=
+
+#+begin_src diff
+diff -u --label \#\<buffer\ chapter_1_tokens.txt\<Brave_New_World\>\> --label \#\<buffer\ chapter_1_tokens.txt\<HC04\>\> /tmp/buffer-content-lVE99K /tmp/buffer-content-FeHBXA
+--- #<buffer chapter_1_tokens.txt<Brave_New_World>>
++++ #<buffer chapter_1_tokens.txt<HC04>>
+@@ -1,5 +1,5 @@
+ A
+-squat
++SQUAT
+ grey
+ building
+ of
+@@ -178,11 +178,11 @@
+ work
+ tables
+ .
+-``
++"
+ And
+ this
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -190,13 +190,13 @@
+ the
+ door
+ ,
+-``
++"
+ is
+ the
+ Fertilizing
+ Room
+ .
+-''
++"
+ Bent
+ over
+ their
+@@ -318,7 +318,7 @@
+ various
+ departments
+ .
+-``
++"
+ Just
+ to
+ give
+@@ -327,7 +327,7 @@
+ general
+ idea
+ ,
+-''
++"
+ he
+ would
+ explain
+@@ -384,7 +384,7 @@
+ ,
+ make
+ for
+-virtue
++virture
+ and
+ happiness
+ ;
+@@ -397,7 +397,7 @@
+ Not
+ philosophers
+ but
+-fret-sawyers
++fretsawyers
+ and
+ stamp
+ collectors
+@@ -407,10 +407,10 @@
+ of
+ society
+ .
+-``
++"
+ To-morrow
+ ,
+-''
++"
+ he
+ would
+ add
+@@ -424,7 +424,7 @@
+ menacing
+ geniality
+ ,
+-``
++"
+ you
+ 'll
+ be
+@@ -444,7 +444,7 @@
+ .
+ Meanwhile
+ …
+-''
++"
+ Meanwhile
+ ,
+ it
+@@ -540,7 +540,8 @@
+ of
+ stability
+ ,
+-A.F.
++A.
++F.
+ 632
+ ,
+ it
+@@ -553,7 +554,7 @@
+ ask
+ it
+ .
+-``
++"
+ I
+ shall
+ begin
+@@ -561,10 +562,11 @@
+ the
+ beginning
+ ,
+-''
++"
+ said
+ the
+-D.H.C.
++D.H.C
++.
+ and
+ the
+ more
+@@ -582,21 +584,21 @@
+ the
+ beginning
+ .
+-``
++"
+ These
+ ,
+-''
++"
+ he
+ waved
+ his
+ hand
+ ,
+-``
++"
+ are
+ the
+ incubators
+ .
+-''
++"
+ And
+ opening
+ an
+@@ -605,28 +607,9 @@
+ he
+ showed
+ them
+-racks
+-upon
+-racks
+-of
+-numbered
+-test-tubes
+-.
+-``
+-The
+-week
+-'s
+-supply
+-of
+-ova
+-.
+-Kept
+-,
+-''
+-he
+ explained
+ ,
+-``
++"
+ at
+ blood
+ heat
+@@ -636,7 +619,7 @@
+ male
+ gametes
+ ,
+-''
++"
+ and
+ here
+ he
+@@ -644,7 +627,7 @@
+ another
+ door
+ ,
+-``
++"
+ they
+ have
+ to
+@@ -661,7 +644,7 @@
+ heat
+ sterilizes
+ .
+-''
++"
+ Rams
+ wrapped
+ in
+@@ -707,7 +690,7 @@
+ its
+ surgical
+ introduction–
+-''
++"
+ the
+ operation
+ undergone
+@@ -734,7 +717,7 @@
+ months
+ '
+ salary
+-''
++"
+ ;
+ continued
+ with
+@@ -962,12 +945,12 @@
+ 's
+ Process
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+ ,
+-''
++"
+ repeated
+ the
+ Director
+@@ -1043,15 +1026,16 @@
+ .
+ Progress
+ .
+-``
++"
+ Essentially
+ ,
+-''
++"
+ the
+-D.H.C.
++D.H.C
++.
+ concluded
+ ,
+-``
++"
+ bokanovskification
+ consists
+ of
+@@ -1078,7 +1062,7 @@
+ by
+ budding
+ .
+-''
++"
+ Responds
+ by
+ budding
+@@ -1309,10 +1293,10 @@
+ a
+ time
+ .
+-``
++"
+ Scores
+ ,
+-''
++"
+ the
+ Director
+ repeated
+@@ -1329,10 +1313,10 @@
+ distributing
+ largesse
+ .
+-``
++"
+ Scores
+ .
+-''
++"
+ But
+ one
+ of
+@@ -1348,12 +1332,12 @@
+ advantage
+ lay
+ .
+-``
++"
+ My
+ good
+ boy
+ !
+-''
++"
+ The
+ Director
+ wheeled
+@@ -1362,7 +1346,7 @@
+ on
+ him
+ .
+-``
++"
+ Ca
+ n't
+ you
+@@ -1373,7 +1357,7 @@
+ you
+ see
+ ?
+-''
++"
+ He
+ raised
+ a
+@@ -1384,7 +1368,7 @@
+ was
+ solemn
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+@@ -1398,7 +1382,7 @@
+ social
+ stability
+ !
+-''
++"
+ Major
+ instruments
+ of
+@@ -1430,7 +1414,7 @@
+ bokanovskified
+ egg
+ .
+-``
++"
+ Ninety-six
+ identical
+ twins
+@@ -1439,7 +1423,7 @@
+ identical
+ machines
+ !
+-''
++"
+ The
+ voice
+ was
+@@ -1448,7 +1432,7 @@
+ with
+ enthusiasm
+ .
+-``
++"
+ You
+ really
+ know
+@@ -1463,25 +1447,25 @@
+ in
+ history
+ .
+-''
++"
+ He
+ quoted
+ the
+ planetary
+ motto
+ .
+-``
++"
+ Community
+ ,
+ Identity
+ ,
+ Stability
+ .
+-''
++"
+ Grand
+ words
+ .
+-``
++"
+ If
+ we
+ could
+@@ -1494,7 +1478,7 @@
+ be
+ solved
+ .
+-''
++"
+ Solved
+ by
+ standard
+@@ -1522,26 +1506,26 @@
+ to
+ biology
+ .
+-``
++"
+ But
+ ,
+ alas
+ ,
+-''
++"
+ the
+ Director
+ shook
+ his
+ head
+ ,
+-``
++"
+ we
+ ca
+ n't
+ bokanovskify
+ indefinitely
+ .
+-''
++"
+ Ninety-six
+ seemed
+ to
+@@ -1595,7 +1579,7 @@
+ was
+ difficult
+ .
+-``
++"
+ For
+ in
+ nature
+@@ -1643,7 +1627,7 @@
+ of
+ that
+ ?
+-''
++"
+ Obviously
+ ,
+ no
+@@ -1719,7 +1703,7 @@
+ same
+ age
+ .
+-``
++"
+ And
+ in
+ exceptional
+@@ -1737,7 +1721,7 @@
+ adult
+ individuals
+ .
+-''
++"
+ Beckoning
+ to
+ a
+@@ -1755,11 +1739,11 @@
+ the
+ moment
+ .
+-``
++"
+ Mr.
+ Foster
+ ,
+-''
++"
+ he
+ called
+ .
+@@ -1769,7 +1753,7 @@
+ man
+ approached
+ .
+-``
++"
+ Can
+ you
+ tell
+@@ -1781,11 +1765,12 @@
+ single
+ ovary
+ ,
+-Mr.
++Mr
++.
+ Foster
+ ?
+-''
+-``
++"
++"
+ Sixteen
+ thousand
+ and
+@@ -1794,7 +1779,7 @@
+ this
+ Centre
+ ,
+-''
++"
+ Mr.
+ Foster
+ replied
+@@ -1821,7 +1806,7 @@
+ quoting
+ figures
+ .
+-``
++"
+ Sixteen
+ thousand
+ and
+@@ -1845,12 +1830,12 @@
+ much
+ better
+ ,
+-''
++"
+ he
+ rattled
+ on
+ ,
+-``
++"
+ in
+ some
+ of
+@@ -1914,7 +1899,7 @@
+ .
+ Still
+ ,
+-''
++"
+ he
+ added
+ ,
+@@ -1941,7 +1926,7 @@
+ challenging
+ )
+ ,
+-``
++"
+ still
+ ,
+ we
+@@ -1996,8 +1981,8 @@
+ them
+ yet
+ .
+-''
+-``
++"
++"
+ That
+ 's
+ the
+@@ -2005,7 +1990,7 @@
+ I
+ like
+ !
+-''
++"
+ cried
+ the
+ Director
+@@ -2016,9 +2001,9 @@
+ Foster
+ on
+ the
+-shoulder
++shouder
+ .
+-``
++"
+ Come
+ along
+ with
+@@ -2035,17 +2020,17 @@
+ expert
+ knowledge
+ .
+-''
++"
+ Mr.
+ Foster
+ smiled
+ modestly
+ .
+-``
++"
+ With
+ pleasure
+ .
+-''
++"
+ They
+ went
+ .
+@@ -2240,9 +2225,7 @@
+ membership
+ of
+ Bokanovsky
+-Group
+-–
+-details
++Group–details
+ were
+ transferred
+ from
+@@ -2281,14 +2264,14 @@
+ Predestination
+ Room
+ .
+-``
++"
+ Eighty-eight
+ cubic
+ metres
+ of
+ card-index
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2299,19 +2282,19 @@
+ they
+ entered
+ .
+-``
++"
+ Containing
+ all
+ the
+ relevant
+ information
+ ,
+-''
++"
+ added
+ the
+ Director
+ .
+-``
++"
+ Brought
+ up
+ to
+@@ -2319,15 +2302,15 @@
+ every
+ morning
+ .
+-''
+-``
++"
++"
+ And
+ co-ordinated
+ every
+ afternoon
+ .
+-''
+-``
++"
++"
+ On
+ the
+ basis
+@@ -2338,8 +2321,8 @@
+ their
+ calculations
+ .
+-''
+-``
++"
++"
+ So
+ many
+ individuals
+@@ -2350,12 +2333,12 @@
+ such
+ quality
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ .
+-``
++"
+ Distributed
+ in
+ such
+@@ -2363,8 +2346,8 @@
+ such
+ quantities
+ .
+-''
+-``
++"
++"
+ The
+ optimum
+ Decanting
+@@ -2374,24 +2357,24 @@
+ given
+ moment
+ .
+-''
+-``
++"
++"
+ Unforeseen
+ wastages
+ promptly
+ made
+ good
+ .
+-''
+-``
++"
++"
+ Promptly
+ ,
+-''
++"
+ repeated
+ Mr.
+ Foster
+ .
+-``
++"
+ If
+ you
+ knew
+@@ -2410,7 +2393,7 @@
+ Japanese
+ earthquake
+ !
+-''
++"
+ He
+ laughed
+ goodhumouredly
+@@ -2419,7 +2402,7 @@
+ his
+ head
+ .
+-``
++"
+ The
+ Predestinators
+ send
+@@ -2430,8 +2413,8 @@
+ the
+ Fertilizers
+ .
+-''
+-``
++"
++"
+ Who
+ give
+ them
+@@ -2441,8 +2424,8 @@
+ ask
+ for
+ .
+-''
+-``
++"
++"
+ And
+ the
+ bottles
+@@ -2455,8 +2438,8 @@
+ in
+ detail
+ .
+-''
+-``
++"
++"
+ After
+ which
+ they
+@@ -2468,15 +2451,15 @@
+ Embryo
+ Store
+ .
+-''
+-``
++"
++"
+ Where
+ we
+ now
+ proceed
+ ourselves
+ .
+-''
++"
+ And
+ opening
+ a
+@@ -2526,14 +2509,14 @@
+ the
+ day
+ .
+-``
++"
+ Embryos
+ are
+ like
+ photograph
+ film
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2547,7 +2530,7 @@
+ second
+ door
+ .
+-``
++"
+ They
+ can
+ only
+@@ -2555,7 +2538,7 @@
+ red
+ light
+ .
+-''
++"
+ And
+ in
+ effect
+@@ -2639,7 +2622,7 @@
+ the
+ air
+ .
+-``
++"
+ Give
+ them
+ a
+@@ -2649,7 +2632,7 @@
+ Mr.
+ Foster
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -2855,18 +2838,18 @@
+ existence–so
+ called
+ .
+-``
++"
+ But
+ in
+ the
+ interval
+ ,
+-''
++"
+ Mr.
+ Foster
+ concluded
+ ,
+-``
++"
+ we
+ 've
+ managed
+@@ -2884,7 +2867,7 @@
+ great
+ deal
+ .
+-''
++"
+ His
+ laugh
+ was
+@@ -2892,7 +2875,7 @@
+ and
+ triumphant
+ .
+-``
++"
+ That
+ 's
+ the
+@@ -2900,14 +2883,14 @@
+ I
+ like
+ ,
+-''
++"
+ said
+ the
+ Director
+ once
+ more
+ .
+-``
++"
+ Let
+ 's
+ walk
+@@ -2918,10 +2901,11 @@
+ them
+ everything
+ ,
+-Mr.
++Mr
++.
+ Foster
+ .
+-''
++"
+ Mr.
+ Foster
+ duly
+@@ -3025,7 +3009,7 @@
+ showed
+ them
+ the
+-reservoir
++resevoir
+ of
+ blood-surrogate
+ ,
+@@ -3060,7 +3044,7 @@
+ troublesome
+ tendency
+ to
+-anæmia
++anaemia
+ ,
+ to
+ the
+@@ -3126,12 +3110,12 @@
+ of
+ the
+ so-called
+-``
++"
+ trauma
+ of
+ decanting
+ ,
+-''
++"
+ and
+ enumerated
+ the
+@@ -3203,17 +3187,17 @@
+ white
+ ground
+ .
+-``
++"
+ For
+ of
+ course
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ in
+ the
+ vast
+@@ -3311,13 +3295,13 @@
+ (
+ except
+ ,
+-''
++"
+ he
+ had
+ to
+ admit
+ ,
+-``
++"
+ that
+ they
+ do
+@@ -3342,12 +3326,12 @@
+ at
+ last
+ ,
+-''
++"
+ continued
+ Mr.
+ Foster
+ ,
+-``
++"
+ out
+ of
+ the
+@@ -3368,7 +3352,7 @@
+ human
+ invention
+ .
+-''
++"
+ He
+ rubbed
+ his
+@@ -3395,7 +3379,7 @@
+ do
+ that
+ .
+-``
++"
+ We
+ also
+ predestine
+@@ -3423,34 +3407,35 @@
+ or
+ future
+ …
+-''
++"
+ He
+ was
+ going
+ to
+ say
+-``
++"
+ future
+ World
+ controllers
+ ,
+-''
++"
+ but
+ correcting
+ himself
+ ,
+ said
+-``
++"
+ future
+ Directors
+ of
+ Hatcheries
+ ,
+-''
++"
+ instead
+ .
+ The
+-D.H.C.
++D.H.C
++.
+ acknowledged
+ the
+ compliment
+@@ -3541,7 +3526,7 @@
+ next
+ pump
+ .
+-``
++"
+ Reducing
+ the
+ number
+@@ -3550,12 +3535,12 @@
+ per
+ minute
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ The
+ surrogate
+ goes
+@@ -3588,14 +3573,14 @@
+ below
+ par
+ .
+-''
++"
+ Again
+ he
+ rubbed
+ his
+ hands
+ .
+-``
++"
+ But
+ why
+ do
+@@ -3608,16 +3593,16 @@
+ below
+ par
+ ?
+-''
++"
+ asked
+ an
+ ingenuous
+ student
+ .
+-``
++"
+ Ass
+ !
+-''
++"
+ said
+ the
+ Director
+@@ -3627,7 +3612,7 @@
+ long
+ silence
+ .
+-``
++"
+ Has
+ n't
+ it
+@@ -3650,7 +3635,7 @@
+ Epsilon
+ heredity
+ ?
+-''
++"
+ It
+ evidently
+ had
+@@ -3665,24 +3650,24 @@
+ with
+ confusion
+ .
+-``
++"
+ The
+ lower
+ the
+ caste
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ the
+ shorter
+ the
+ oxygen
+ .
+-''
++"
+ The
+ first
+ organ
+@@ -3714,7 +3699,7 @@
+ eyeless
+ monsters
+ .
+-``
++"
+ Who
+ are
+ no
+@@ -3722,7 +3707,7 @@
+ at
+ all
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+@@ -3759,12 +3744,12 @@
+ to
+ Society
+ !
+-``
++"
+ Consider
+ the
+ horse
+ .
+-''
++"
+ They
+ considered
+ it
+@@ -3811,19 +3796,19 @@
+ human
+ intelligence
+ .
+-``
++"
+ But
+ in
+ Epsilons
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ very
+ justly
+ ,
+-``
++"
+ we
+ do
+ n't
+@@ -3831,7 +3816,7 @@
+ human
+ intelligence
+ .
+-''
++"
+ Did
+ n't
+ need
+@@ -3899,10 +3884,10 @@
+ the
+ Community
+ !
+-``
++"
+ Enormous
+ !
+-''
++"
+ murmured
+ the
+ students
+@@ -4138,11 +4123,11 @@
+ metres
+ wide
+ .
+-``
++"
+ Heat
+ conditioning
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4215,7 +4200,7 @@
+ their
+ bodies
+ .
+-``
++"
+ We
+ condition
+ them
+@@ -4224,12 +4209,12 @@
+ on
+ heat
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+ .
+-``
++"
+ Our
+ colleagues
+ upstairs
+@@ -4240,19 +4225,19 @@
+ love
+ it
+ .
+-''
+-``
++"
++"
+ And
+ that
+ ,
+-''
++"
+ put
+ in
+ the
+ Director
+ sententiously
+ ,
+-``
++"
+ that
+ is
+ the
+@@ -4282,7 +4267,7 @@
+ social
+ destiny
+ .
+-''
++"
+ In
+ a
+ gap
+@@ -4324,12 +4309,12 @@
+ in
+ silence
+ .
+-``
++"
+ Well
+ ,
+ Lenina
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4372,10 +4357,10 @@
+ uncommonly
+ pretty
+ .
+-``
++"
+ Henry
+ !
+-''
++"
+ Her
+ smile
+ flashed
+@@ -4387,12 +4372,12 @@
+ coral
+ teeth
+ .
+-``
++"
+ Charming
+ ,
+ charming
+ ,
+-''
++"
+ murmured
+ the
+ Director
+@@ -4416,14 +4401,14 @@
+ for
+ himself
+ .
+-``
++"
+ What
+ are
+ you
+ giving
+ them
+ ?
+-''
++"
+ asked
+ Mr.
+ Foster
+@@ -4434,7 +4419,7 @@
+ very
+ professional
+ .
+-``
++"
+ Oh
+ ,
+ the
+@@ -4444,8 +4429,8 @@
+ sleeping
+ sickness
+ .
+-''
+-``
++"
++"
+ Tropical
+ workers
+ start
+@@ -4455,7 +4440,7 @@
+ Metre
+ 150
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+@@ -4463,7 +4448,7 @@
+ the
+ students
+ .
+-``
++"
+ The
+ embryos
+ still
+@@ -4481,7 +4466,7 @@
+ 's
+ diseases
+ .
+-''
++"
+ Then
+ ,
+ turning
+@@ -4489,7 +4474,7 @@
+ to
+ Lenina
+ ,
+-``
++"
+ Ten
+ to
+ five
+@@ -4499,22 +4484,22 @@
+ this
+ afternoon
+ ,
+-''
++"
+ he
+ said
+ ,
+-``
++"
+ as
+ usual
+ .
+-''
+-``
++"
++"
+ Charming
+ ,
+-''
++"
+ said
+ the
+-Director
++Dhector
+ once
+ more
+ ,
+@@ -4592,7 +4577,7 @@
+ constant
+ rotation
+ .
+-``
++"
+ To
+ improve
+ their
+@@ -4600,12 +4585,12 @@
+ of
+ balance
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ Doing
+ repairs
+ on
+@@ -4658,7 +4643,7 @@
+ associate
+ topsy-turvydom
+ with
+-well-being
++weli-being
+ ;
+ in
+ fact
+@@ -4676,17 +4661,17 @@
+ their
+ heads
+ .
+-``
++"
+ And
+ now
+ ,
+-''
++"
+ Mr.
+ Foster
+ went
+ on
+ ,
+-``
++"
+ I
+ 'd
+ like
+@@ -4717,7 +4702,7 @@
+ Gallery
+ level
+ ,
+-''
++"
+ he
+ called
+ to
+@@ -4734,7 +4719,7 @@
+ ground
+ floor
+ .
+-``
++"
+ They
+ 're
+ round
+@@ -4742,11 +4727,11 @@
+ Metre
+ 900
+ ,
+-''
++"
+ he
+ explained
+ .
+-``
++"
+ You
+ ca
+ n't
+@@ -4767,7 +4752,7 @@
+ Follow
+ me
+ .
+-''
++"
+ But
+ the
+ Director
+@@ -4777,16 +4762,16 @@
+ his
+ watch
+ .
+-``
++"
+ Ten
+ to
+ three
+ ,
+-''
++"
+ he
+ said
+ .
+-``
++"
+ No
+ time
+ for
+@@ -4814,13 +4799,13 @@
+ afternoon
+ sleep
+ .
+-''
++"
+ Mr.
+ Foster
+ was
+ disappointed
+ .
+-``
++"
+ At
+ least
+ one
+@@ -4830,24 +4815,24 @@
+ Decanting
+ Room
+ ,
+-''
++"
+ he
+ pleaded
+ .
+-``
++"
+ Very
+ well
+ then
+ .
+-''
++"
+ The
+ Director
+ smiled
+ indulgently
+ .
+-``
++"
+ Just
+ one
+ glance
+ .
+-''
++"
+
+Diff finished.  Fri Jun 27 13:52:41 2025
+#+end_src
+
+**** HC06
+
+Problèmes :
+
+- capitalisation :: =squat -> SQUAT=
+- tokénisation + caractère remplacé :: =goose-flesh -> goose ? flesh=, =Six-year-old -> Six-year ? old=
+- guillemets :: =`` -> "=, ='' -> ""=
+- tokénisation :: =A.F. -> A. F.=, =D.H.C. -> D.H.C .=, =Mr. -> Mr .=, =Group - -> Group-=
+- chapter trailer :: =∅ -> Brave New World=
+- points de suspension :: =… -> ...=
+
+#+begin_src diff
+diff -u --label \#\<buffer\ chapter_1_tokens.txt\<Brave_New_World\>\> --label \#\<buffer\ chapter_1_tokens.txt\<HC06\>\> /tmp/buffer-content-1rik8W /tmp/buffer-content-YbEXe7
+--- #<buffer chapter_1_tokens.txt<Brave_New_World>>
++++ #<buffer chapter_1_tokens.txt<HC06>>
+@@ -1,5 +1,5 @@
+ A
+-squat
++SQUAT
+ grey
+ building
+ of
+@@ -91,7 +91,9 @@
+ shape
+ of
+ academic
+-goose-flesh
++goose
++?
++flesh
+ ,
+ but
+ finding
+@@ -178,11 +180,11 @@
+ work
+ tables
+ .
+-``
++"
+ And
+ this
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -190,13 +192,13 @@
+ the
+ door
+ ,
+-``
++"
+ is
+ the
+ Fertilizing
+ Room
+ .
+-''
++"
+ Bent
+ over
+ their
+@@ -318,7 +320,7 @@
+ various
+ departments
+ .
+-``
++"
+ Just
+ to
+ give
+@@ -327,7 +329,7 @@
+ general
+ idea
+ ,
+-''
++"
+ he
+ would
+ explain
+@@ -407,10 +409,10 @@
+ of
+ society
+ .
+-``
++"
+ To-morrow
+ ,
+-''
++"
+ he
+ would
+ add
+@@ -424,7 +426,7 @@
+ menacing
+ geniality
+ ,
+-``
++"
+ you
+ 'll
+ be
+@@ -443,8 +445,8 @@
+ generalities
+ .
+ Meanwhile
+-…
+-''
++...
++"
+ Meanwhile
+ ,
+ it
+@@ -540,7 +542,8 @@
+ of
+ stability
+ ,
+-A.F.
++A.
++F.
+ 632
+ ,
+ it
+@@ -553,7 +556,7 @@
+ ask
+ it
+ .
+-``
++"
+ I
+ shall
+ begin
+@@ -561,10 +564,11 @@
+ the
+ beginning
+ ,
+-''
++"
+ said
+ the
+-D.H.C.
++D.H.C
++.
+ and
+ the
+ more
+@@ -582,21 +586,21 @@
+ the
+ beginning
+ .
+-``
++"
+ These
+ ,
+-''
++"
+ he
+ waved
+ his
+ hand
+ ,
+-``
++"
+ are
+ the
+ incubators
+ .
+-''
++"
+ And
+ opening
+ an
+@@ -612,7 +616,7 @@
+ numbered
+ test-tubes
+ .
+-``
++"
+ The
+ week
+ 's
+@@ -622,11 +626,11 @@
+ .
+ Kept
+ ,
+-''
++"
+ he
+ explained
+ ,
+-``
++"
+ at
+ blood
+ heat
+@@ -636,7 +640,7 @@
+ male
+ gametes
+ ,
+-''
++"
+ and
+ here
+ he
+@@ -644,7 +648,7 @@
+ another
+ door
+ ,
+-``
++"
+ they
+ have
+ to
+@@ -661,7 +665,7 @@
+ heat
+ sterilizes
+ .
+-''
++"
+ Rams
+ wrapped
+ in
+@@ -707,7 +711,7 @@
+ its
+ surgical
+ introduction–
+-''
++"
+ the
+ operation
+ undergone
+@@ -734,7 +738,7 @@
+ months
+ '
+ salary
+-''
++"
+ ;
+ continued
+ with
+@@ -962,12 +966,12 @@
+ 's
+ Process
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+ ,
+-''
++"
+ repeated
+ the
+ Director
+@@ -1043,15 +1047,16 @@
+ .
+ Progress
+ .
+-``
++"
+ Essentially
+ ,
+-''
++"
+ the
+-D.H.C.
++D.H.C
++.
+ concluded
+ ,
+-``
++"
+ bokanovskification
+ consists
+ of
+@@ -1078,7 +1083,7 @@
+ by
+ budding
+ .
+-''
++"
+ Responds
+ by
+ budding
+@@ -1309,10 +1314,10 @@
+ a
+ time
+ .
+-``
++"
+ Scores
+ ,
+-''
++"
+ the
+ Director
+ repeated
+@@ -1329,10 +1334,10 @@
+ distributing
+ largesse
+ .
+-``
++"
+ Scores
+ .
+-''
++"
+ But
+ one
+ of
+@@ -1348,12 +1353,12 @@
+ advantage
+ lay
+ .
+-``
++"
+ My
+ good
+ boy
+ !
+-''
++"
+ The
+ Director
+ wheeled
+@@ -1362,7 +1367,7 @@
+ on
+ him
+ .
+-``
++"
+ Ca
+ n't
+ you
+@@ -1373,7 +1378,7 @@
+ you
+ see
+ ?
+-''
++"
+ He
+ raised
+ a
+@@ -1384,7 +1389,7 @@
+ was
+ solemn
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+@@ -1398,7 +1403,7 @@
+ social
+ stability
+ !
+-''
++"
+ Major
+ instruments
+ of
+@@ -1430,7 +1435,7 @@
+ bokanovskified
+ egg
+ .
+-``
++"
+ Ninety-six
+ identical
+ twins
+@@ -1439,7 +1444,7 @@
+ identical
+ machines
+ !
+-''
++"
+ The
+ voice
+ was
+@@ -1448,7 +1453,7 @@
+ with
+ enthusiasm
+ .
+-``
++"
+ You
+ really
+ know
+@@ -1463,25 +1468,25 @@
+ in
+ history
+ .
+-''
++"
+ He
+ quoted
+ the
+ planetary
+ motto
+ .
+-``
++"
+ Community
+ ,
+ Identity
+ ,
+ Stability
+ .
+-''
++"
+ Grand
+ words
+ .
+-``
++"
+ If
+ we
+ could
+@@ -1494,7 +1499,7 @@
+ be
+ solved
+ .
+-''
++"
+ Solved
+ by
+ standard
+@@ -1522,26 +1527,26 @@
+ to
+ biology
+ .
+-``
++"
+ But
+ ,
+ alas
+ ,
+-''
++"
+ the
+ Director
+ shook
+ his
+ head
+ ,
+-``
++"
+ we
+ ca
+ n't
+ bokanovskify
+ indefinitely
+ .
+-''
++"
+ Ninety-six
+ seemed
+ to
+@@ -1595,7 +1600,7 @@
+ was
+ difficult
+ .
+-``
++"
+ For
+ in
+ nature
+@@ -1643,7 +1648,7 @@
+ of
+ that
+ ?
+-''
++"
+ Obviously
+ ,
+ no
+@@ -1719,7 +1724,7 @@
+ same
+ age
+ .
+-``
++"
+ And
+ in
+ exceptional
+@@ -1737,7 +1742,7 @@
+ adult
+ individuals
+ .
+-''
++"
+ Beckoning
+ to
+ a
+@@ -1755,11 +1760,11 @@
+ the
+ moment
+ .
+-``
++"
+ Mr.
+ Foster
+ ,
+-''
++"
+ he
+ called
+ .
+@@ -1769,7 +1774,7 @@
+ man
+ approached
+ .
+-``
++"
+ Can
+ you
+ tell
+@@ -1781,11 +1786,12 @@
+ single
+ ovary
+ ,
+-Mr.
++Mr
++.
+ Foster
+ ?
+-''
+-``
++"
++"
+ Sixteen
+ thousand
+ and
+@@ -1794,7 +1800,7 @@
+ this
+ Centre
+ ,
+-''
++"
+ Mr.
+ Foster
+ replied
+@@ -1821,7 +1827,7 @@
+ quoting
+ figures
+ .
+-``
++"
+ Sixteen
+ thousand
+ and
+@@ -1845,12 +1851,12 @@
+ much
+ better
+ ,
+-''
++"
+ he
+ rattled
+ on
+ ,
+-``
++"
+ in
+ some
+ of
+@@ -1914,7 +1920,7 @@
+ .
+ Still
+ ,
+-''
++"
+ he
+ added
+ ,
+@@ -1941,7 +1947,7 @@
+ challenging
+ )
+ ,
+-``
++"
+ still
+ ,
+ we
+@@ -1996,8 +2002,8 @@
+ them
+ yet
+ .
+-''
+-``
++"
++"
+ That
+ 's
+ the
+@@ -2005,7 +2011,7 @@
+ I
+ like
+ !
+-''
++"
+ cried
+ the
+ Director
+@@ -2018,7 +2024,7 @@
+ the
+ shoulder
+ .
+-``
++"
+ Come
+ along
+ with
+@@ -2035,17 +2041,17 @@
+ expert
+ knowledge
+ .
+-''
++"
+ Mr.
+ Foster
+ smiled
+ modestly
+ .
+-``
++"
+ With
+ pleasure
+ .
+-''
++"
+ They
+ went
+ .
+@@ -2214,7 +2220,7 @@
+ solution
+ poured
+ in
+-…
++...
+ and
+ already
+ the
+@@ -2240,8 +2246,7 @@
+ membership
+ of
+ Bokanovsky
+-Group
+-–
++Group–
+ details
+ were
+ transferred
+@@ -2281,14 +2286,14 @@
+ Predestination
+ Room
+ .
+-``
++"
+ Eighty-eight
+ cubic
+ metres
+ of
+ card-index
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2299,19 +2304,19 @@
+ they
+ entered
+ .
+-``
++"
+ Containing
+ all
+ the
+ relevant
+ information
+ ,
+-''
++"
+ added
+ the
+ Director
+ .
+-``
++"
+ Brought
+ up
+ to
+@@ -2319,15 +2324,15 @@
+ every
+ morning
+ .
+-''
+-``
++"
++"
+ And
+ co-ordinated
+ every
+ afternoon
+ .
+-''
+-``
++"
++"
+ On
+ the
+ basis
+@@ -2338,8 +2343,8 @@
+ their
+ calculations
+ .
+-''
+-``
++"
++"
+ So
+ many
+ individuals
+@@ -2350,12 +2355,13 @@
+ such
+ quality
+ ,
+-''
++"
+ said
+-Mr.
++Mr
++.
+ Foster
+ .
+-``
++"
+ Distributed
+ in
+ such
+@@ -2363,8 +2369,8 @@
+ such
+ quantities
+ .
+-''
+-``
++"
++"
+ The
+ optimum
+ Decanting
+@@ -2374,24 +2380,24 @@
+ given
+ moment
+ .
+-''
+-``
++"
++"
+ Unforeseen
+ wastages
+ promptly
+ made
+ good
+ .
+-''
+-``
++"
++"
+ Promptly
+ ,
+-''
++"
+ repeated
+ Mr.
+ Foster
+ .
+-``
++"
+ If
+ you
+ knew
+@@ -2410,7 +2416,7 @@
+ Japanese
+ earthquake
+ !
+-''
++"
+ He
+ laughed
+ goodhumouredly
+@@ -2419,7 +2425,7 @@
+ his
+ head
+ .
+-``
++"
+ The
+ Predestinators
+ send
+@@ -2430,8 +2436,8 @@
+ the
+ Fertilizers
+ .
+-''
+-``
++"
++"
+ Who
+ give
+ them
+@@ -2441,8 +2447,8 @@
+ ask
+ for
+ .
+-''
+-``
++"
++"
+ And
+ the
+ bottles
+@@ -2455,8 +2461,8 @@
+ in
+ detail
+ .
+-''
+-``
++"
++"
+ After
+ which
+ they
+@@ -2468,15 +2474,15 @@
+ Embryo
+ Store
+ .
+-''
+-``
++"
++"
+ Where
+ we
+ now
+ proceed
+ ourselves
+ .
+-''
++"
+ And
+ opening
+ a
+@@ -2526,14 +2532,14 @@
+ the
+ day
+ .
+-``
++"
+ Embryos
+ are
+ like
+ photograph
+ film
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2547,7 +2553,7 @@
+ second
+ door
+ .
+-``
++"
+ They
+ can
+ only
+@@ -2555,7 +2561,7 @@
+ red
+ light
+ .
+-''
++"
+ And
+ in
+ effect
+@@ -2639,7 +2645,7 @@
+ the
+ air
+ .
+-``
++"
+ Give
+ them
+ a
+@@ -2649,7 +2655,7 @@
+ Mr.
+ Foster
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -2855,18 +2861,18 @@
+ existence–so
+ called
+ .
+-``
++"
+ But
+ in
+ the
+ interval
+ ,
+-''
++"
+ Mr.
+ Foster
+ concluded
+ ,
+-``
++"
+ we
+ 've
+ managed
+@@ -2884,7 +2890,7 @@
+ great
+ deal
+ .
+-''
++"
+ His
+ laugh
+ was
+@@ -2892,7 +2898,7 @@
+ and
+ triumphant
+ .
+-``
++"
+ That
+ 's
+ the
+@@ -2900,14 +2906,14 @@
+ I
+ like
+ ,
+-''
++"
+ said
+ the
+ Director
+ once
+ more
+ .
+-``
++"
+ Let
+ 's
+ walk
+@@ -2918,10 +2924,11 @@
+ them
+ everything
+ ,
+-Mr.
++Mr
++.
+ Foster
+ .
+-''
++"
+ Mr.
+ Foster
+ duly
+@@ -3126,12 +3133,12 @@
+ of
+ the
+ so-called
+-``
++"
+ trauma
+ of
+ decanting
+ ,
+-''
++"
+ and
+ enumerated
+ the
+@@ -3203,17 +3210,17 @@
+ white
+ ground
+ .
+-``
++"
+ For
+ of
+ course
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ in
+ the
+ vast
+@@ -3311,13 +3318,13 @@
+ (
+ except
+ ,
+-''
++"
+ he
+ had
+ to
+ admit
+ ,
+-``
++"
+ that
+ they
+ do
+@@ -3342,12 +3349,12 @@
+ at
+ last
+ ,
+-''
++"
+ continued
+ Mr.
+ Foster
+ ,
+-``
++"
+ out
+ of
+ the
+@@ -3368,7 +3375,7 @@
+ human
+ invention
+ .
+-''
++"
+ He
+ rubbed
+ his
+@@ -3395,7 +3402,7 @@
+ do
+ that
+ .
+-``
++"
+ We
+ also
+ predestine
+@@ -3422,35 +3429,36 @@
+ workers
+ or
+ future
+-…
+-''
++...
++"
+ He
+ was
+ going
+ to
+ say
+-``
++"
+ future
+ World
+ controllers
+ ,
+-''
++"
+ but
+ correcting
+ himself
+ ,
+ said
+-``
++"
+ future
+ Directors
+ of
+ Hatcheries
+ ,
+-''
++"
+ instead
+ .
+ The
+-D.H.C.
++D.H.C
++.
+ acknowledged
+ the
+ compliment
+@@ -3507,7 +3515,7 @@
+ Down
+ ,
+ down
+-…
++...
+ A
+ final
+ twist
+@@ -3541,7 +3549,7 @@
+ next
+ pump
+ .
+-``
++"
+ Reducing
+ the
+ number
+@@ -3550,12 +3558,12 @@
+ per
+ minute
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ The
+ surrogate
+ goes
+@@ -3588,14 +3596,14 @@
+ below
+ par
+ .
+-''
++"
+ Again
+ he
+ rubbed
+ his
+ hands
+ .
+-``
++"
+ But
+ why
+ do
+@@ -3608,16 +3616,16 @@
+ below
+ par
+ ?
+-''
++"
+ asked
+ an
+ ingenuous
+ student
+ .
+-``
++"
+ Ass
+ !
+-''
++"
+ said
+ the
+ Director
+@@ -3627,7 +3635,7 @@
+ long
+ silence
+ .
+-``
++"
+ Has
+ n't
+ it
+@@ -3650,7 +3658,7 @@
+ Epsilon
+ heredity
+ ?
+-''
++"
+ It
+ evidently
+ had
+@@ -3665,24 +3673,24 @@
+ with
+ confusion
+ .
+-``
++"
+ The
+ lower
+ the
+ caste
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ the
+ shorter
+ the
+ oxygen
+ .
+-''
++"
+ The
+ first
+ organ
+@@ -3714,7 +3722,7 @@
+ eyeless
+ monsters
+ .
+-``
++"
+ Who
+ are
+ no
+@@ -3722,7 +3730,7 @@
+ at
+ all
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+@@ -3759,12 +3767,12 @@
+ to
+ Society
+ !
+-``
++"
+ Consider
+ the
+ horse
+ .
+-''
++"
+ They
+ considered
+ it
+@@ -3811,19 +3819,19 @@
+ human
+ intelligence
+ .
+-``
++"
+ But
+ in
+ Epsilons
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ very
+ justly
+ ,
+-``
++"
+ we
+ do
+ n't
+@@ -3831,7 +3839,7 @@
+ human
+ intelligence
+ .
+-''
++"
+ Did
+ n't
+ need
+@@ -3899,10 +3907,10 @@
+ the
+ Community
+ !
+-``
++"
+ Enormous
+ !
+-''
++"
+ murmured
+ the
+ students
+@@ -4016,7 +4024,9 @@
+ socially
+ useless
+ .
+-Six-year-old
++Six-year
++?
++old
+ men
+ and
+ women
+@@ -4138,11 +4148,11 @@
+ metres
+ wide
+ .
+-``
++"
+ Heat
+ conditioning
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4215,7 +4225,7 @@
+ their
+ bodies
+ .
+-``
++"
+ We
+ condition
+ them
+@@ -4224,12 +4234,12 @@
+ on
+ heat
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+ .
+-``
++"
+ Our
+ colleagues
+ upstairs
+@@ -4240,19 +4250,19 @@
+ love
+ it
+ .
+-''
+-``
++"
++"
+ And
+ that
+ ,
+-''
++"
+ put
+ in
+ the
+ Director
+ sententiously
+ ,
+-``
++"
+ that
+ is
+ the
+@@ -4282,7 +4292,7 @@
+ social
+ destiny
+ .
+-''
++"
+ In
+ a
+ gap
+@@ -4324,12 +4334,12 @@
+ in
+ silence
+ .
+-``
++"
+ Well
+ ,
+ Lenina
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4372,10 +4382,10 @@
+ uncommonly
+ pretty
+ .
+-``
++"
+ Henry
+ !
+-''
++"
+ Her
+ smile
+ flashed
+@@ -4387,12 +4397,12 @@
+ coral
+ teeth
+ .
+-``
++"
+ Charming
+ ,
+ charming
+ ,
+-''
++"
+ murmured
+ the
+ Director
+@@ -4416,14 +4426,14 @@
+ for
+ himself
+ .
+-``
++"
+ What
+ are
+ you
+ giving
+ them
+ ?
+-''
++"
+ asked
+ Mr.
+ Foster
+@@ -4434,7 +4444,7 @@
+ very
+ professional
+ .
+-``
++"
+ Oh
+ ,
+ the
+@@ -4444,8 +4454,8 @@
+ sleeping
+ sickness
+ .
+-''
+-``
++"
++"
+ Tropical
+ workers
+ start
+@@ -4455,7 +4465,7 @@
+ Metre
+ 150
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+@@ -4463,7 +4473,7 @@
+ the
+ students
+ .
+-``
++"
+ The
+ embryos
+ still
+@@ -4481,7 +4491,7 @@
+ 's
+ diseases
+ .
+-''
++"
+ Then
+ ,
+ turning
+@@ -4489,7 +4499,7 @@
+ to
+ Lenina
+ ,
+-``
++"
+ Ten
+ to
+ five
+@@ -4499,19 +4509,19 @@
+ this
+ afternoon
+ ,
+-''
++"
+ he
+ said
+ ,
+-``
++"
+ as
+ usual
+ .
+-''
+-``
++"
++"
+ Charming
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -4592,7 +4602,7 @@
+ constant
+ rotation
+ .
+-``
++"
+ To
+ improve
+ their
+@@ -4600,12 +4610,12 @@
+ of
+ balance
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ Doing
+ repairs
+ on
+@@ -4676,17 +4686,17 @@
+ their
+ heads
+ .
+-``
++"
+ And
+ now
+ ,
+-''
++"
+ Mr.
+ Foster
+ went
+ on
+ ,
+-``
++"
+ I
+ 'd
+ like
+@@ -4717,7 +4727,7 @@
+ Gallery
+ level
+ ,
+-''
++"
+ he
+ called
+ to
+@@ -4734,7 +4744,7 @@
+ ground
+ floor
+ .
+-``
++"
+ They
+ 're
+ round
+@@ -4742,11 +4752,11 @@
+ Metre
+ 900
+ ,
+-''
++"
+ he
+ explained
+ .
+-``
++"
+ You
+ ca
+ n't
+@@ -4767,7 +4777,7 @@
+ Follow
+ me
+ .
+-''
++"
+ But
+ the
+ Director
+@@ -4777,16 +4787,16 @@
+ his
+ watch
+ .
+-``
++"
+ Ten
+ to
+ three
+ ,
+-''
++"
+ he
+ said
+ .
+-``
++"
+ No
+ time
+ for
+@@ -4814,13 +4824,13 @@
+ afternoon
+ sleep
+ .
+-''
++"
+ Mr.
+ Foster
+ was
+ disappointed
+ .
+-``
++"
+ At
+ least
+ one
+@@ -4830,24 +4840,27 @@
+ Decanting
+ Room
+ ,
+-''
++"
+ he
+ pleaded
+ .
+-``
++"
+ Very
+ well
+ then
+ .
+-''
++"
+ The
+ Director
+ smiled
+ indulgently
+ .
+-``
++"
+ Just
+ one
+ glance
+ .
+-''
++"
++Brave
++New
++World
+
+Diff finished.  Fri Jun 27 14:03:19 2025
+#+end_src
+
+**** RB06
+
+- guillemets :: =`` -> "=, ='' -> ""=
+- caractères différents :: =intelligently–though -> intelligently—though=, =Group – details -> Group—details=
+- tirets manquants :: =re-examined -> reexamined=, =screw-driver -> screwdriver=
+- tokénisation :: =A.F. -> A.F .=, =D.H.C. -> D.H.C .=, =Mr. -> Mr .=
+- typo novelties? :: =hew -> flew=
+- s ajouté :: =bottle -> bottles=, =miner -> miners=
+
+#+begin_src diff
+diff -u --label \#\<buffer\ chapter_1_tokens.txt\<Brave_New_World\>\> --label \#\<buffer\ chapter_1_tokens.txt\<RB06\>\> /tmp/buffer-content-aj33vR /tmp/buffer-content-RikZC4
+--- #<buffer chapter_1_tokens.txt<Brave_New_World>>
++++ #<buffer chapter_1_tokens.txt<RB06>>
+@@ -178,11 +178,11 @@
+ work
+ tables
+ .
+-``
++"
+ And
+ this
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -190,13 +190,13 @@
+ the
+ door
+ ,
+-``
++"
+ is
+ the
+ Fertilizing
+ Room
+ .
+-''
++"
+ Bent
+ over
+ their
+@@ -297,9 +297,8 @@
+ privilege
+ .
+ The
+-D.
+-H.
+-C.
++D.H.C
++.
+ for
+ Central
+ London
+@@ -318,7 +317,7 @@
+ various
+ departments
+ .
+-``
++"
+ Just
+ to
+ give
+@@ -327,7 +326,7 @@
+ general
+ idea
+ ,
+-''
++"
+ he
+ would
+ explain
+@@ -353,7 +352,7 @@
+ do
+ their
+ work
+-intelligently–though
++intelligently—though
+ as
+ little
+ of
+@@ -397,7 +396,7 @@
+ Not
+ philosophers
+ but
+-fret-sawyers
++fretsawyers
+ and
+ stamp
+ collectors
+@@ -407,10 +406,10 @@
+ of
+ society
+ .
+-``
++"
+ To-morrow
+ ,
+-''
++"
+ he
+ would
+ add
+@@ -424,7 +423,7 @@
+ menacing
+ geniality
+ ,
+-``
++"
+ you
+ 'll
+ be
+@@ -444,7 +443,7 @@
+ .
+ Meanwhile
+ …
+-''
++"
+ Meanwhile
+ ,
+ it
+@@ -540,7 +539,8 @@
+ of
+ stability
+ ,
+-A.F.
++A.F
++.
+ 632
+ ,
+ it
+@@ -553,7 +553,7 @@
+ ask
+ it
+ .
+-``
++"
+ I
+ shall
+ begin
+@@ -561,10 +561,11 @@
+ the
+ beginning
+ ,
+-''
++"
+ said
+ the
+-D.H.C.
++D.H.C
++.
+ and
+ the
+ more
+@@ -582,21 +583,21 @@
+ the
+ beginning
+ .
+-``
++"
+ These
+ ,
+-''
++"
+ he
+ waved
+ his
+ hand
+ ,
+-``
++"
+ are
+ the
+ incubators
+ .
+-''
++"
+ And
+ opening
+ an
+@@ -612,7 +613,7 @@
+ numbered
+ test-tubes
+ .
+-``
++"
+ The
+ week
+ 's
+@@ -622,11 +623,11 @@
+ .
+ Kept
+ ,
+-''
++"
+ he
+ explained
+ ,
+-``
++"
+ at
+ blood
+ heat
+@@ -636,7 +637,7 @@
+ male
+ gametes
+ ,
+-''
++"
+ and
+ here
+ he
+@@ -644,7 +645,7 @@
+ another
+ door
+ ,
+-``
++"
+ they
+ have
+ to
+@@ -661,7 +662,7 @@
+ heat
+ sterilizes
+ .
+-''
++"
+ Rams
+ wrapped
+ in
+@@ -706,8 +707,8 @@
+ of
+ its
+ surgical
+-introduction–
+-''
++introduction—
++"
+ the
+ operation
+ undergone
+@@ -734,7 +735,7 @@
+ months
+ '
+ salary
+-''
++"
+ ;
+ continued
+ with
+@@ -861,7 +862,7 @@
+ bouillon
+ containing
+ free-swimming
+-spermatozoa–at
++spermatozoa—at
+ a
+ minimum
+ concentration
+@@ -894,7 +895,7 @@
+ and
+ its
+ contents
+-re-examined
++reexamined
+ ;
+ how
+ ,
+@@ -962,12 +963,12 @@
+ 's
+ Process
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+ ,
+-''
++"
+ repeated
+ the
+ Director
+@@ -990,7 +991,7 @@
+ embryo
+ ,
+ one
+-adult-normality
++adult—normality
+ .
+ But
+ a
+@@ -1043,15 +1044,16 @@
+ .
+ Progress
+ .
+-``
++"
+ Essentially
+ ,
+-''
++"
+ the
+-D.H.C.
++D.H.C
++.
+ concluded
+ ,
+-``
++"
+ bokanovskification
+ consists
+ of
+@@ -1078,7 +1080,7 @@
+ by
+ budding
+ .
+-''
++"
+ Responds
+ by
+ budding
+@@ -1109,7 +1111,6 @@
+ box
+ ,
+ another
+-,
+ rack-full
+ was
+ emerging
+@@ -1229,18 +1230,18 @@
+ again
+ and
+ having
+-budded–bud
++budded—bud
+ out
+ of
+ bud
+ out
+ of
+-bud–were
+-thereafter–further
++bud—were
++thereafter—further
+ arrest
+ being
+ generally
+-fatal–left
++fatal—left
+ to
+ develop
+ in
+@@ -1264,8 +1265,7 @@
+ eight
+ to
+ ninety-six
+-embryos–
+-a
++embryos—a
+ prodigious
+ improvement
+ ,
+@@ -1277,7 +1277,7 @@
+ nature
+ .
+ Identical
+-twins–but
++twins—but
+ not
+ in
+ piddling
+@@ -1309,10 +1309,10 @@
+ a
+ time
+ .
+-``
++"
+ Scores
+ ,
+-''
++"
+ the
+ Director
+ repeated
+@@ -1329,10 +1329,10 @@
+ distributing
+ largesse
+ .
+-``
++"
+ Scores
+ .
+-''
++"
+ But
+ one
+ of
+@@ -1348,12 +1348,12 @@
+ advantage
+ lay
+ .
+-``
++"
+ My
+ good
+ boy
+ !
+-''
++"
+ The
+ Director
+ wheeled
+@@ -1362,7 +1362,7 @@
+ on
+ him
+ .
+-``
++"
+ Ca
+ n't
+ you
+@@ -1373,7 +1373,7 @@
+ you
+ see
+ ?
+-''
++"
+ He
+ raised
+ a
+@@ -1384,7 +1384,7 @@
+ was
+ solemn
+ .
+-``
++"
+ Bokanovsky
+ 's
+ Process
+@@ -1398,7 +1398,7 @@
+ social
+ stability
+ !
+-''
++"
+ Major
+ instruments
+ of
+@@ -1430,7 +1430,7 @@
+ bokanovskified
+ egg
+ .
+-``
++"
+ Ninety-six
+ identical
+ twins
+@@ -1439,7 +1439,7 @@
+ identical
+ machines
+ !
+-''
++"
+ The
+ voice
+ was
+@@ -1448,7 +1448,7 @@
+ with
+ enthusiasm
+ .
+-``
++"
+ You
+ really
+ know
+@@ -1463,25 +1463,25 @@
+ in
+ history
+ .
+-''
++"
+ He
+ quoted
+ the
+ planetary
+ motto
+ .
+-``
++"
+ Community
+ ,
+ Identity
+ ,
+ Stability
+ .
+-''
++"
+ Grand
+ words
+ .
+-``
++"
+ If
+ we
+ could
+@@ -1494,7 +1494,7 @@
+ be
+ solved
+ .
+-''
++"
+ Solved
+ by
+ standard
+@@ -1522,26 +1522,26 @@
+ to
+ biology
+ .
+-``
++"
+ But
+ ,
+ alas
+ ,
+-''
++"
+ the
+ Director
+ shook
+ his
+ head
+ ,
+-``
++"
+ we
+ ca
+ n't
+ bokanovskify
+ indefinitely
+ .
+-''
++"
+ Ninety-six
+ seemed
+ to
+@@ -1574,7 +1574,7 @@
+ identical
+ twins
+ as
+-possible–that
++possible—that
+ was
+ the
+ best
+@@ -1595,7 +1595,7 @@
+ was
+ difficult
+ .
+-``
++"
+ For
+ in
+ nature
+@@ -1635,7 +1635,7 @@
+ quarter
+ of
+ a
+-century–what
++century—what
+ would
+ be
+ the
+@@ -1643,7 +1643,7 @@
+ of
+ that
+ ?
+-''
++"
+ Obviously
+ ,
+ no
+@@ -1682,13 +1682,13 @@
+ .
+ Fertilize
+ and
+-bokanovskify–in
++bokanovskify—in
+ other
+ words
+ ,
+ multiply
+ by
+-seventy-two–and
++seventy-two—and
+ you
+ get
+ an
+@@ -1719,7 +1719,7 @@
+ same
+ age
+ .
+-``
++"
+ And
+ in
+ exceptional
+@@ -1737,7 +1737,7 @@
+ adult
+ individuals
+ .
+-''
++"
+ Beckoning
+ to
+ a
+@@ -1755,11 +1755,11 @@
+ the
+ moment
+ .
+-``
++"
+ Mr.
+ Foster
+ ,
+-''
++"
+ he
+ called
+ .
+@@ -1769,7 +1769,7 @@
+ man
+ approached
+ .
+-``
++"
+ Can
+ you
+ tell
+@@ -1781,11 +1781,12 @@
+ single
+ ovary
+ ,
+-Mr.
++Mr
++.
+ Foster
+ ?
+-''
+-``
++"
++"
+ Sixteen
+ thousand
+ and
+@@ -1794,7 +1795,7 @@
+ this
+ Centre
+ ,
+-''
++"
+ Mr.
+ Foster
+ replied
+@@ -1821,7 +1822,7 @@
+ quoting
+ figures
+ .
+-``
++"
+ Sixteen
+ thousand
+ and
+@@ -1845,12 +1846,12 @@
+ much
+ better
+ ,
+-''
++"
+ he
+ rattled
+ on
+ ,
+-``
++"
+ in
+ some
+ of
+@@ -1914,7 +1915,7 @@
+ .
+ Still
+ ,
+-''
++"
+ he
+ added
+ ,
+@@ -1941,7 +1942,7 @@
+ challenging
+ )
+ ,
+-``
++"
+ still
+ ,
+ we
+@@ -1996,8 +1997,8 @@
+ them
+ yet
+ .
+-''
+-``
++"
++"
+ That
+ 's
+ the
+@@ -2005,7 +2006,7 @@
+ I
+ like
+ !
+-''
++"
+ cried
+ the
+ Director
+@@ -2018,7 +2019,7 @@
+ the
+ shoulder
+ .
+-``
++"
+ Come
+ along
+ with
+@@ -2035,17 +2036,17 @@
+ expert
+ knowledge
+ .
+-''
++"
+ Mr.
+ Foster
+ smiled
+ modestly
+ .
+-``
++"
+ With
+ pleasure
+ .
+-''
++"
+ They
+ went
+ .
+@@ -2095,7 +2096,7 @@
+ !
+ the
+ lift-hatches
+-hew
++flew
+ open
+ ;
+ the
+@@ -2240,9 +2241,7 @@
+ membership
+ of
+ Bokanovsky
+-Group
+-–
+-details
++Group—details
+ were
+ transferred
+ from
+@@ -2281,14 +2280,14 @@
+ Predestination
+ Room
+ .
+-``
++"
+ Eighty-eight
+ cubic
+ metres
+ of
+ card-index
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2299,19 +2298,19 @@
+ they
+ entered
+ .
+-``
++"
+ Containing
+ all
+ the
+ relevant
+ information
+ ,
+-''
++"
+ added
+ the
+ Director
+ .
+-``
++"
+ Brought
+ up
+ to
+@@ -2319,15 +2318,15 @@
+ every
+ morning
+ .
+-''
+-``
++"
++"
+ And
+ co-ordinated
+ every
+ afternoon
+ .
+-''
+-``
++"
++"
+ On
+ the
+ basis
+@@ -2338,8 +2337,8 @@
+ their
+ calculations
+ .
+-''
+-``
++"
++"
+ So
+ many
+ individuals
+@@ -2350,12 +2349,12 @@
+ such
+ quality
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ .
+-``
++"
+ Distributed
+ in
+ such
+@@ -2363,8 +2362,8 @@
+ such
+ quantities
+ .
+-''
+-``
++"
++"
+ The
+ optimum
+ Decanting
+@@ -2374,24 +2373,24 @@
+ given
+ moment
+ .
+-''
+-``
++"
++"
+ Unforeseen
+ wastages
+ promptly
+ made
+ good
+ .
+-''
+-``
++"
++"
+ Promptly
+ ,
+-''
++"
+ repeated
+ Mr.
+ Foster
+ .
+-``
++"
+ If
+ you
+ knew
+@@ -2410,7 +2409,7 @@
+ Japanese
+ earthquake
+ !
+-''
++"
+ He
+ laughed
+ goodhumouredly
+@@ -2419,7 +2418,7 @@
+ his
+ head
+ .
+-``
++"
+ The
+ Predestinators
+ send
+@@ -2430,8 +2429,8 @@
+ the
+ Fertilizers
+ .
+-''
+-``
++"
++"
+ Who
+ give
+ them
+@@ -2441,8 +2440,8 @@
+ ask
+ for
+ .
+-''
+-``
++"
++"
+ And
+ the
+ bottles
+@@ -2455,8 +2454,8 @@
+ in
+ detail
+ .
+-''
+-``
++"
++"
+ After
+ which
+ they
+@@ -2468,15 +2467,15 @@
+ Embryo
+ Store
+ .
+-''
+-``
++"
++"
+ Where
+ we
+ now
+ proceed
+ ourselves
+ .
+-''
++"
+ And
+ opening
+ a
+@@ -2526,14 +2525,14 @@
+ the
+ day
+ .
+-``
++"
+ Embryos
+ are
+ like
+ photograph
+ film
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -2547,7 +2546,7 @@
+ second
+ door
+ .
+-``
++"
+ They
+ can
+ only
+@@ -2555,7 +2554,7 @@
+ red
+ light
+ .
+-''
++"
+ And
+ in
+ effect
+@@ -2639,7 +2638,7 @@
+ the
+ air
+ .
+-``
++"
+ Give
+ them
+ a
+@@ -2649,7 +2648,7 @@
+ Mr.
+ Foster
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -2852,21 +2851,21 @@
+ Room
+ .
+ Independent
+-existence–so
++existence—so
+ called
+ .
+-``
++"
+ But
+ in
+ the
+ interval
+ ,
+-''
++"
+ Mr.
+ Foster
+ concluded
+ ,
+-``
++"
+ we
+ 've
+ managed
+@@ -2884,7 +2883,7 @@
+ great
+ deal
+ .
+-''
++"
+ His
+ laugh
+ was
+@@ -2892,7 +2891,7 @@
+ and
+ triumphant
+ .
+-``
++"
+ That
+ 's
+ the
+@@ -2900,14 +2899,14 @@
+ I
+ like
+ ,
+-''
++"
+ said
+ the
+ Director
+ once
+ more
+ .
+-``
++"
+ Let
+ 's
+ walk
+@@ -2918,10 +2917,11 @@
+ them
+ everything
+ ,
+-Mr.
++Mr
++.
+ Foster
+ .
+-''
++"
+ Mr.
+ Foster
+ duly
+@@ -3126,12 +3126,12 @@
+ of
+ the
+ so-called
+-``
++"
+ trauma
+ of
+ decanting
+ ,
+-''
++"
+ and
+ enumerated
+ the
+@@ -3173,7 +3173,7 @@
+ the
+ system
+ of
+-labelling–a
++labelling—a
+ T
+ for
+ the
+@@ -3203,17 +3203,17 @@
+ white
+ ground
+ .
+-``
++"
+ For
+ of
+ course
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ in
+ the
+ vast
+@@ -3232,7 +3232,7 @@
+ ovary
+ in
+ twelve
+-hundred–that
++hundred—that
+ would
+ really
+ be
+@@ -3305,19 +3305,19 @@
+ 're
+ decanted
+ as
+-freemartins–structurally
++freemartins—structurally
+ quite
+ normal
+ (
+ except
+ ,
+-''
++"
+ he
+ had
+ to
+ admit
+ ,
+-``
++"
+ that
+ they
+ do
+@@ -3342,12 +3342,12 @@
+ at
+ last
+ ,
+-''
++"
+ continued
+ Mr.
+ Foster
+ ,
+-``
++"
+ out
+ of
+ the
+@@ -3368,7 +3368,7 @@
+ human
+ invention
+ .
+-''
++"
+ He
+ rubbed
+ his
+@@ -3395,7 +3395,7 @@
+ do
+ that
+ .
+-``
++"
+ We
+ also
+ predestine
+@@ -3423,34 +3423,35 @@
+ or
+ future
+ …
+-''
++"
+ He
+ was
+ going
+ to
+ say
+-``
++"
+ future
+ World
+ controllers
+ ,
+-''
++"
+ but
+ correcting
+ himself
+ ,
+ said
+-``
++"
+ future
+ Directors
+ of
+ Hatcheries
+ ,
+-''
++"
+ instead
+ .
+ The
+-D.H.C.
++D.H.C
++.
+ acknowledged
+ the
+ compliment
+@@ -3474,7 +3475,7 @@
+ was
+ busy
+ with
+-screw-driver
++screwdriver
+ and
+ spanner
+ on
+@@ -3541,7 +3542,7 @@
+ next
+ pump
+ .
+-``
++"
+ Reducing
+ the
+ number
+@@ -3550,12 +3551,12 @@
+ per
+ minute
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ The
+ surrogate
+ goes
+@@ -3588,14 +3589,14 @@
+ below
+ par
+ .
+-''
++"
+ Again
+ he
+ rubbed
+ his
+ hands
+ .
+-``
++"
+ But
+ why
+ do
+@@ -3608,16 +3609,16 @@
+ below
+ par
+ ?
+-''
++"
+ asked
+ an
+ ingenuous
+ student
+ .
+-``
++"
+ Ass
+ !
+-''
++"
+ said
+ the
+ Director
+@@ -3627,7 +3628,7 @@
+ long
+ silence
+ .
+-``
++"
+ Has
+ n't
+ it
+@@ -3650,7 +3651,7 @@
+ Epsilon
+ heredity
+ ?
+-''
++"
+ It
+ evidently
+ had
+@@ -3665,24 +3666,24 @@
+ with
+ confusion
+ .
+-``
++"
+ The
+ lower
+ the
+ caste
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ ,
+-``
++"
+ the
+ shorter
+ the
+ oxygen
+ .
+-''
++"
+ The
+ first
+ organ
+@@ -3714,7 +3715,7 @@
+ eyeless
+ monsters
+ .
+-``
++"
+ Who
+ are
+ no
+@@ -3722,7 +3723,7 @@
+ at
+ all
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+@@ -3759,12 +3760,12 @@
+ to
+ Society
+ !
+-``
++"
+ Consider
+ the
+ horse
+ .
+-''
++"
+ They
+ considered
+ it
+@@ -3811,19 +3812,19 @@
+ human
+ intelligence
+ .
+-``
++"
+ But
+ in
+ Epsilons
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+ very
+ justly
+ ,
+-``
++"
+ we
+ do
+ n't
+@@ -3831,7 +3832,7 @@
+ human
+ intelligence
+ .
+-''
++"
+ Did
+ n't
+ need
+@@ -3899,10 +3900,10 @@
+ the
+ Community
+ !
+-``
++"
+ Enormous
+ !
+-''
++"
+ murmured
+ the
+ students
+@@ -4113,7 +4114,7 @@
+ enclosed
+ and
+ the
+-bottle
++bottles
+ performed
+ the
+ remainder
+@@ -4138,11 +4139,11 @@
+ metres
+ wide
+ .
+-``
++"
+ Heat
+ conditioning
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4191,7 +4192,7 @@
+ ,
+ to
+ be
+-miner
++miners
+ and
+ acetate
+ silk
+@@ -4215,7 +4216,7 @@
+ their
+ bodies
+ .
+-``
++"
+ We
+ condition
+ them
+@@ -4224,12 +4225,12 @@
+ on
+ heat
+ ,
+-''
++"
+ concluded
+ Mr.
+ Foster
+ .
+-``
++"
+ Our
+ colleagues
+ upstairs
+@@ -4240,19 +4241,19 @@
+ love
+ it
+ .
+-''
+-``
++"
++"
+ And
+ that
+ ,
+-''
++"
+ put
+ in
+ the
+ Director
+ sententiously
+ ,
+-``
++"
+ that
+ is
+ the
+@@ -4260,7 +4261,7 @@
+ of
+ happiness
+ and
+-virtue–liking
++virtue—liking
+ what
+ you
+ 've
+@@ -4278,11 +4279,11 @@
+ people
+ like
+ their
+-unescapable
++un-escapable
+ social
+ destiny
+ .
+-''
++"
+ In
+ a
+ gap
+@@ -4324,12 +4325,12 @@
+ in
+ silence
+ .
+-``
++"
+ Well
+ ,
+ Lenina
+ ,
+-''
++"
+ said
+ Mr.
+ Foster
+@@ -4372,27 +4373,27 @@
+ uncommonly
+ pretty
+ .
+-``
++"
+ Henry
+ !
+-''
++"
+ Her
+ smile
+ flashed
+ redly
+ at
+-him–a
++him—a
+ row
+ of
+ coral
+ teeth
+ .
+-``
++"
+ Charming
+ ,
+ charming
+ ,
+-''
++"
+ murmured
+ the
+ Director
+@@ -4416,14 +4417,14 @@
+ for
+ himself
+ .
+-``
++"
+ What
+ are
+ you
+ giving
+ them
+ ?
+-''
++"
+ asked
+ Mr.
+ Foster
+@@ -4434,7 +4435,7 @@
+ very
+ professional
+ .
+-``
++"
+ Oh
+ ,
+ the
+@@ -4444,8 +4445,8 @@
+ sleeping
+ sickness
+ .
+-''
+-``
++"
++"
+ Tropical
+ workers
+ start
+@@ -4455,7 +4456,7 @@
+ Metre
+ 150
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+@@ -4463,7 +4464,7 @@
+ the
+ students
+ .
+-``
++"
+ The
+ embryos
+ still
+@@ -4481,7 +4482,7 @@
+ 's
+ diseases
+ .
+-''
++"
+ Then
+ ,
+ turning
+@@ -4489,7 +4490,7 @@
+ to
+ Lenina
+ ,
+-``
++"
+ Ten
+ to
+ five
+@@ -4499,19 +4500,19 @@
+ this
+ afternoon
+ ,
+-''
++"
+ he
+ said
+ ,
+-``
++"
+ as
+ usual
+ .
+-''
+-``
++"
++"
+ Charming
+ ,
+-''
++"
+ said
+ the
+ Director
+@@ -4592,7 +4593,7 @@
+ constant
+ rotation
+ .
+-``
++"
+ To
+ improve
+ their
+@@ -4600,12 +4601,12 @@
+ of
+ balance
+ ,
+-''
++"
+ Mr.
+ Foster
+ explained
+ .
+-``
++"
+ Doing
+ repairs
+ on
+@@ -4676,17 +4677,17 @@
+ their
+ heads
+ .
+-``
++"
+ And
+ now
+ ,
+-''
++"
+ Mr.
+ Foster
+ went
+ on
+ ,
+-``
++"
+ I
+ 'd
+ like
+@@ -4717,7 +4718,7 @@
+ Gallery
+ level
+ ,
+-''
++"
+ he
+ called
+ to
+@@ -4734,7 +4735,7 @@
+ ground
+ floor
+ .
+-``
++"
+ They
+ 're
+ round
+@@ -4742,11 +4743,11 @@
+ Metre
+ 900
+ ,
+-''
++"
+ he
+ explained
+ .
+-``
++"
+ You
+ ca
+ n't
+@@ -4767,7 +4768,7 @@
+ Follow
+ me
+ .
+-''
++"
+ But
+ the
+ Director
+@@ -4777,16 +4778,16 @@
+ his
+ watch
+ .
+-``
++"
+ Ten
+ to
+ three
+ ,
+-''
++"
+ he
+ said
+ .
+-``
++"
+ No
+ time
+ for
+@@ -4814,13 +4815,13 @@
+ afternoon
+ sleep
+ .
+-''
++"
+ Mr.
+ Foster
+ was
+ disappointed
+ .
+-``
++"
+ At
+ least
+ one
+@@ -4830,24 +4831,24 @@
+ Decanting
+ Room
+ ,
+-''
++"
+ he
+ pleaded
+ .
+-``
++"
+ Very
+ well
+ then
+ .
+-''
++"
+ The
+ Director
+ smiled
+ indulgently
+ .
+-``
++"
+ Just
+ one
+ glance
+ .
+-''
++"
+
+Diff finished.  Fri Jun 27 14:18:02 2025
+#+end_src
+
+*** Performance
+
+[[./plots/edition_comparison.png]]
+
+1% des tokens = 800 tokens
+=> gain de 0.1% = +80 tokens récupérés
+
+
+- La performance naive est déjà très haute
+- Toutes les techniques permettent d'améliorer la performance
+- La combinaison des techniques permet une plus grande amélioration
+
+* Ajout d'une stratégie =case=
+
+La stratégie =case= permet de corriger un token utilisateur dont la
+casse est incorrecte. Par exemple (cas réel dans /Brave New World/):
+
+#+begin_example
+ref          pred
+---          ----
+A            a
+squat        SQUAT < token perdu (substitution)
+grey         grey
+building     building
+#+end_example
+
+[[./plots/full_books/strats.png]]
+
+* Ajout d'une meta-stratégie =cycle=
+
+Il était déjà possible d'enchaîner des stratégies, par exemple:
+
+#+begin_example
+case -> split -> bert -> propagate
+#+end_example
+
+Mais l'ordre de ces opération a une importance. Après le dernier appel
+à =propagate=, il est possible qu'une autre stratégie puisse apporter de
+nouvelles améliorations suite à une correction obtenue à cet appel.
+
+La stratégie =cycle= corrige ce défaut en permettant un retour en
+arrière suite à une amélioration. La séquence se répète tant qu'au
+moins une stratégie apporte une amélioration.
+
+En pratique, nous ne relevons qu'une faible amélioration par rapport
+au pipeline défini ci-dessus.
+
+[[./plots/full_books/strats.png]]
+
+En terme de performance temporelle, la stratégie cycle est bien plus
+lente :
+
+[[./plots/full_books/strat_h=2_duration_s.png]]
+
+* Considérations défensives
+
+En utilisant notre chiffrement actuel token par token, un attaquant
+peut très facilement casser le chiffrement avec la méthode suivante:
+
+1. trouver un dictionnaire dans la langue
+2. créer une table de hachage ayant pour clés les entrées du
+   dictionnaire et pour valeurs leur hash
+3. déchiffrer le corpus à l'aide de cette table
+
+
+De plus, même sans l'existence d'une table de hachage, on peut
+facilement estimer le nombre d'essais moyen nécéssaires pour
+déterminer le premier token, en utilisant une attaque par
+dictionnaire. On note ce token $X$, et sa distribution de probabilité
+$p = (p_1, p_2, p_3, ..., p_n)$, avec $n$ la taille du vocabulaire. On
+l'ordonne telle que $p_1 > p_2 > ... > p_n$. La formule suivante donne
+le nombre d'essais moyens ou /guesswork/
+(https://www.isiweb.ee.ethz.ch/archive/massey_pub/pdf/BI633.pdf) :
+
+$$ E[G] = \sum_i^n i * p_i $$
+
+Dans le cas d'une distribution uniforme, on obtient un nombre d'essais
+moyen de 73652.5 (borne haute) sur /1984/. En connaissant parfaitement
+la distribution, on obtient un nombre d'essais moyen de 651.95 (borne
+basse). Dans les deux cas, il est extrêmement simple d'utiliser une
+attaque par force brute. La ressource wordnet comprend 147306 mots,
+qui sont hashable en moins d'une seconde!
+
+** Utilisation de ngrams (overlap de 1)
+
+En utilisant des ngrams, on peut tracer la courbe de nombre d'essais
+suivante en supposant une connaissance parfaite de la distribution des
+ngrams :
+
+[[./plots/perfect_tries.png]]
+
+(note: le calcul est impossible à faire en utilisant une distribution
+uniforme car le nombre de possibilité explose).
+
+Le nombre d'essais reste trop faible pour espérer une sécurité. Mais
+que se passe-t-il en supposant une distribution de probabilité
+approchée ?
+
+L'attaquant pourrait obtenir une distribution approchée en prenant des
+textes représentatifs. Pour expérimenter, on peut supposer que
+l'attaquant a accès au reste du corpus Novelties. Peut-il retrouver
+une distribution de probabilité qui lui permet de tenter une attaque ?
+En tentant l'expérience, on se rend rapidement compte qu'il faut
+discuter de la couverture de cette distribution. En effet, tous les
+ngrams du livre cible ne sont pas forcément présents dans le corpus
+d'attaque, car il y a énormément de ngrams possibles. Formellement, on
+définit la /couverture/ comme $\frac{|V \cup A|}{|V|}$, avec $V$ le
+vocabulaire de ngrams du livre cible et $A$ le vocabulaire de ngrams
+du corpus d'attaque.
+
+[[./plots/ngrams_coverage.png]]
+
+En réalité, la couverture est trop faible pour espérer tenter une
+attaque par dictonnaire. (à voir sur de plus grand corpus d'attaques
+?)
+
+
+*** Attaque domino
+
+Nos ngrams ont un overlap de 1, ce qui constitue une faiblesse
+fatale. Prenons par exemple n=3:
+
+#+begin_example
+A B C D E
+=> (A B C) (B C D) (C D E)
+#+end_example
+
+Dans ce cas, si on arrive à déchiffrer le ngram =(B C D)=, les ngrams
+environnants sont facile à déchiffrer : il ne reste qu'à faire des
+essais sur le premier token du ngram précédent et le dernier token du
+token suivant.
+
+
+** Réduction de la taille du hash
+
+Réduire la taille du hash permet de créer des collisions, et donc
+d'augmenter la difficulté d'une attaque. Sur 1984, on observe le
+nombre de collisions suivant en fonction de la taille du hash:
+
+[[./plots/hash_collisions.png]]
+
+Précedemment, on avait obtenu la performance suivante en fontion de la
+taille du hash:
+
+[[./plots/hash_len.png]]
+
+Sur les différentes éditions de "Brave New World", on obtient la
+performance suivante avec une taille de hash de 2:
+
+[[./plots/full_books/strats_h=2.png]]
+
+La performance diminue par rapport à une taille de hash de 64, mais
+reste correcte. La méthode cycle apporte une légère amélioration dans
+ce cas.
+
+*** Attaque par LLM
+
+Une attaque possible consiste à hasher un vocabulaire, ce qui permet
+d'obtenir un ensemble de tokens possible pour chaque token chiffré,
+puis à utiliser un LLM pour prendre une décision sur le mot qui était
+chiffré.
+
+Pour déchiffrer une séquence, il faut alors explorer un arbre dont le
+nombre de noeuds explose rapidement. Une possibilité est d'utiliser un
+algorithme de beam search contraint par l'ensemble de tokens possible
+pour chaque token chiffré.
+
+On réalise l'expérience on donnant les 100 premiers tokens d'un livre
+à différents LLM, et en leur demandant de générer les 25 tokens
+suivants avec une génération contrainte:
+
+#+PLOT: ind:1 deps:(2) type:2d with:histograms set:"yrange [0:]"
+| LLM             | Pourcentage de tokens récupérés | Beams |
+|-----------------+---------------------------------+-------|
+| Distribution    |                             63% |     - |
+| GPT-2 (124m)    |                             48% |     4 |
+| gemma-3-270m-it |                             40% |     4 |
+| gemma-3-270m    |                             56% |     4 |
+| Llama-3.2-1B    |                             68% |     4 |
+
+* Paramètres optimaux des stratégies
+
+** BERT
+
+On étudie la taille de la fenêtre de BERT parmi la grille suivante:
+16, 32, 64, 128.
+
+[[./plots/full_books/mlm_window.png]]
+
+* Exploration restante
+
+- Autre types de perturbations: OCR, problème de tokénisation 
+  - Quelle est la performance typique d'un algorithme d'OCR?
+- Tester sur des livres complets
+- Tester sur différentes éditions du même livre
+- Alignement des tokens non déchiffrés restants par découpage
+  successifs (dans le cas d'une erreur de tokenization où un mot est
+  fusionné côté utilisateur)
+- Mots unique (ou peu fréquents) en clair pour éviter les attaques par
+  fréquence
+  - Combien de mots uniques / peu fréquents dans le corpus ?
+- Tronquer le hash pour éviter les attaques par fréquence
+- BERT pour récupérer les tokens non déchiffrés restants
+- Utilisation des tags ?
+- Fenêtre avec overlap de n-1 pour éviter les attaques par fréquences
+  (les n-grams sont moins fréquents que les tokens)
+- Application à tout type de données séquentielles non alignées
+  (séquences ADN... ?)
+- Phase de normalisation
+- Autres méthodes d'alignment
+- Traduction
