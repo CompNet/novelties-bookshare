@@ -8326,3 +8326,4 @@ Diff finished.  Fri Sep 12 14:14:59 2025
 5. Annexes
    1. Étude de cas sur des traductions
    2. Paramètres des différentes stratégies
+   3. Résultats supplémentaires sur Brave New World
