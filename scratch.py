@@ -1,5 +1,14 @@
 # -*- eval: (code-cells-mode); -*-
 # %%
+from tests.test_encrypt_decrypt import test_substitution
+
+ref_tokens = "A B C D E E".split()
+user_tokens = "A B C D E X".split()
+tags = "B-PER O O O B-PER I-PER".split()
+pred_tokens = decrypt_tokens(encrypt_tokens(ref_tokens), tags, user_tokens)
+assert pred_tokens == "A B C D E [UNK]".split()
+
+# %%
 from typing import *
 import pathlib as pl
 from novelties_bookshare.conll import load_conll2002_bio
@@ -33,6 +42,96 @@ def load_book(path: pl.Path) -> tuple[list[str], list[str]]:
         tokens += chapter_tokens
         tags += chapter_tags
     return tokens, tags
+
+
+# %%
+from novelties_bookshare.encrypt import encrypt_tokens
+from novelties_bookshare.decrypt import (
+    decrypt_tokens,
+    make_plugin_mlm,
+    make_plugin_split,
+    make_plugin_propagate,
+    make_plugin_case,
+)
+from novelties_bookshare.experiments.data import load_book
+from novelties_bookshare.experiments.metrics import errors_nb
+
+gold_tokens, gold_tags = load_book(
+    "./data/editions_diff/Moby_Dick/Novelties", chapter_limit=None
+)
+user_tokens, _ = load_book("./data/editions_diff/Moby_Dick/PG15", chapter_limit=None)
+
+
+def normalize_(tokens: list[str], replacements: list[tuple[list[str], str]]):
+    for i, token in enumerate(tokens):
+        for repl_source, repl_target in replacements:
+            if token in repl_source:
+                tokens[i] = repl_target
+
+
+normalize_(gold_tokens, [(["``", "''", "“", "”"], '"')])
+normalize_(gold_tokens, [(["‘", "’"], "'")])
+normalize_(gold_tokens, [(["…"], "...")])
+normalize_(gold_tokens, [(["—"], "-")])
+normalize_(user_tokens, [(["``", "''", "“", "”"], '"')])
+normalize_(user_tokens, [(["‘", "’"], "'")])
+normalize_(user_tokens, [(["…"], "...")])
+normalize_(user_tokens, [(["—"], "-")])
+
+encrypted = encrypt_tokens(gold_tokens)
+print("decrypting with split...")
+decrypted_with_split = decrypt_tokens(
+    encrypted,
+    gold_tags,
+    user_tokens,
+    decryption_plugins=[
+        make_plugin_split(max_token_len=24, max_splits_nb=4),
+    ],
+)
+print("decrypting with pipe...")
+decrypted_with_pipe = decrypt_tokens(
+    encrypted,
+    gold_tags,
+    user_tokens,
+    decryption_plugins=[
+        make_plugin_case(),
+        make_plugin_split(max_token_len=24, max_splits_nb=4),
+        make_plugin_mlm("answerdotai/ModernBERT-base", window=16, device="cuda"),
+        make_plugin_propagate(),
+    ],
+)
+
+print(errors_nb(gold_tokens, decrypted_with_split))
+print(errors_nb(gold_tokens, decrypted_with_pipe))
+
+# %% Benchmarking aligning multiple chapters vs a single one
+import time
+from novelties_bookshare.experiments.data import iter_book_chapters, load_book
+from novelties_bookshare.encrypt import encrypt_tokens
+from novelties_bookshare.decrypt import (
+    decrypt_tokens,
+    make_plugin_mlm,
+    make_plugin_split,
+    make_plugin_propagate,
+    make_plugin_case,
+)
+
+gold_tokens = load_book("./data/editions_diff/Moby_Dick/Novelties")
+user_tokens = load_book("./data/editions_diff/Moby_Dick/PG15")
+encrypted = encrypt_tokens(gold_tokens)
+t0 = time.process_time()
+_ = decrypt_tokens(encrypted, user_tokens)
+t1 = time.process_time()
+print(t1 - t0)
+
+encrypted = [
+    encrypt_tokens(tokens)
+    for tokens in iter_book_chapters("./data/editions_diff/Moby_Dick/Novelties/")
+]
+user_tokens = list(iter_book_chapters("./data/editions_diff/Moby_Dick/PG15"))
+_ = decrypt_tokens(encrypted, user_tokens=user_tokens)
+t2 = time.process_time()
+print(t2 - t1)
 
 
 # %%
@@ -339,6 +438,9 @@ fig.suptitle("Impact of errors")
 plt.show()
 
 # %%
+from tqdm import tqdm
+from novelties_bookshare.decrypt import decrypt_tokens
+
 x = []
 y = []
 y_naive = []
@@ -979,14 +1081,4 @@ print(
 
 
 # %%
-import re
-
-
-def get_params(metric_key: str) -> tuple[str, dict[str, str]]:
-    # form of each metric
-    # w=window.e=edition.metric_name
-    m = re.match(r"w=([^\.]+)\.e=([^\.]+)\.(.*)", metric_key)
-    if m is None:
-        return "", {}
-    window, edition, metric_name = m.groups()
-    return metric_name, {"window": window, "edition": edition}
+from novelties_bookshare.experiments.errors import token_split, token_merge
