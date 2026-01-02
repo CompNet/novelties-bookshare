@@ -1,5 +1,47 @@
 # -*- eval: (code-cells-mode); -*-
 # %%
+from novelties_bookshare.experiments.data import (
+    normalize_,
+    EDITION_SETS,
+    iter_book_chapters,
+)
+from novelties_bookshare.experiments.metrics import errors, errors_nb
+from novelties_bookshare.encrypt import encrypt_tokens
+from novelties_bookshare.decrypt import decrypt_tokens
+from more_itertools import flatten
+
+F1818 = list(iter_book_chapters(EDITION_SETS["Frankenstein"]["F-1818"]))
+normalize_(F1818)
+F1823 = list(iter_book_chapters(EDITION_SETS["Frankenstein"]["F-1823"]))
+normalize_(F1823)
+F1831 = list(iter_book_chapters(EDITION_SETS["Frankenstein"]["F-1831"]))
+normalize_(F1831)
+
+eF1818 = [encrypt_tokens(chapter) for chapter in F1818]
+eF1823 = [encrypt_tokens(chapter) for chapter in F1823]
+eF1831 = [encrypt_tokens(chapter) for chapter in F1831]
+
+dF1818 = decrypt_tokens(eF1818, F1823, hash_len=64)
+print(errors_nb(list(flatten(F1818)), dF1818))
+F1818_error_dict = errors(list(flatten(F1818)), dF1818)
+
+dF1831 = decrypt_tokens(list(flatten(eF1831)), list(flatten(F1818)), hash_len=64)
+print(errors_nb(list(flatten(F1831)), dF1831))
+F1931_error_dict = errors(list(flatten(F1831)), dF1831)
+
+# %%
+from novelties_bookshare.decrypt import make_plugin_propagate
+
+dF1831 = decrypt_tokens(
+    list(flatten(eF1831)),
+    list(flatten(F1818)),
+    hash_len=64,
+    decryption_plugins=[make_plugin_propagate()],
+)
+print(errors_nb(list(flatten(F1831)), dF1831))
+
+
+# %%
 from tests.test_encrypt_decrypt import test_substitution
 
 ref_tokens = "A B C D E E".split()
